@@ -289,23 +289,23 @@ class HRNetBackbone(nn.Module):
         # Create C3 at 1/8 resolution (same as R8)
         target_size_c3 = (r8.shape[2], r8.shape[3])
         concat_c3 = self._align_and_concat([r4, r8, r16, r32], target_size_c3)
-        print(f"DEBUG concat_c3 shape: {concat_c3.shape}")
+        # print(f"DEBUG concat_c3 shape: {concat_c3.shape}")
         C3 = self.c3_head(concat_c3)
-        print(f"DEBUG C3 shape after head: {C3.shape}")
+        # print(f"DEBUG C3 shape after head: {C3.shape}")
         
         # Create C4 at 1/16 resolution (same as R16)
         target_size_c4 = (r16.shape[2], r16.shape[3])
         concat_c4 = self._align_and_concat([r4, r8, r16, r32], target_size_c4)
-        print(f"DEBUG concat_c4 shape: {concat_c4.shape}")
+        # print(f"DEBUG concat_c4 shape: {concat_c4.shape}")
         C4 = self.c4_head(concat_c4)
-        print(f"DEBUG C4 shape after head: {C4.shape}")
+        # print(f"DEBUG C4 shape after head: {C4.shape}")
         
         # Create C5 at 1/32 resolution (same as R32)
         target_size_c5 = (r32.shape[2], r32.shape[3])
         concat_c5 = self._align_and_concat([r4, r8, r16, r32], target_size_c5)
-        print(f"DEBUG concat_c5 shape: {concat_c5.shape}")
+        # print(f"DEBUG concat_c5 shape: {concat_c5.shape}")
         C5 = self.c5_head(concat_c5)
-        print(f"DEBUG C5 shape after head: {C5.shape}")
+        # print(f"DEBUG C5 shape after head: {C5.shape}")
 
         # Store feature dict
         feature_dict = {
