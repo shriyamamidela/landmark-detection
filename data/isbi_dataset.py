@@ -18,13 +18,19 @@ class ISBIDataset(object):
         else:
             raise ValueError("mode could only be train, valid or test")
 
-        self.imgaes_root_path = os.path.join(dataset_folder_path, self.mode, "images")
+        # Fix paths for actual ISBI structure
+        if mode == "train":
+            self.images_root_path = os.path.join(dataset_folder_path, "Dataset", "Training")
+        elif mode == "valid":
+            self.images_root_path = os.path.join(dataset_folder_path, "Dataset", "Testing", "Test1")
+        else:  # test
+            self.images_root_path = os.path.join(dataset_folder_path, "Dataset", "Testing", "Test2")
 
-        self.annotations_root_path = os.path.join(dataset_folder_path, self.mode, "annotations")
-        self.senior_annotations_root = os.path.join(self.annotations_root_path, "senior-orthodontist")
-        self.junior_annotations_root = os.path.join(self.annotations_root_path, "junior-orthodontist")
+        # Annotations paths
+        self.senior_annotations_root = os.path.join(dataset_folder_path, "Annotations", "Senior Orthodontist")
+        self.junior_annotations_root = os.path.join(dataset_folder_path, "Annotations", "Junior Orthodontist")
 
-        self.images_list = list(sorted(os.listdir(self.imgaes_root_path)))
+        self.images_list = list(sorted(os.listdir(self.images_root_path)))
 
     def __getitem__(self, index: int):
         image_file_name = self.images_list[index]
@@ -36,7 +42,7 @@ class ISBIDataset(object):
         return image, label
 
     def get_image(self, file_name: str):
-        file_path = os.path.join(self.imgaes_root_path, file_name)
+        file_path = os.path.join(self.images_root_path, file_name)
 
         image = cv2.imread(file_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
