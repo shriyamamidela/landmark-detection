@@ -1,6 +1,7 @@
 """
-Train Feature Extraction (Backbone + SFB) Only
-No landmark detection or refinement - just learn good features
+Train Feature Extraction (Backbone + Semantic Fusion Block)
+For HRNet-W48 backbone
+Only trains backbone + SFB to learn strong features (no landmark modules)
 """
 
 import torch
@@ -16,32 +17,41 @@ import argparse
 from utils import rescale_input
 
 
+# ---------------------------------------------------------------------- #
+# Model definition
+# ---------------------------------------------------------------------- #
 class FeatureExtractionModel(nn.Module):
     """Simplified model for feature extraction training"""
     def __init__(self, backbone_name, backbone_weights=None):
         super(FeatureExtractionModel, self).__init__()
         
         # Backbone
-        self.backbone = Backbone(name=backbone_name, pretrained=False, weights_root_path=backbone_weights)
+        self.backbone = Backbone(
+            name=backbone_name,
+            pretrained=False,
+            weights_root_path=backbone_weights
+        )
         self.backbone_name = backbone_name
         
-        # Get output channels for SFB (will be set after first forward)
+        # Semantic Fusion Block (initialized dynamically)
         self.sfb = None
         self.initialized = False
     
     def forward(self, x):
-        # Get backbone features
+        # Forward through backbone
         _ = self.backbone(x)
         
-        # Get feature dict
-        if hasattr(self.backbone, 'get_feature_dict'):
-            feat_dict = self.backbone.get_feature_dict()
-        else:
-            feat_dict = {}
+        # Get HRNet feature dictionary
+        feat_dict = self.backbone.get_feature_dict() if hasattr(self.backbone, 'get_feature_dict') else {}
         
-        C3 = feat_dict.get("C3")
-        C4 = feat_dict.get("C4")
-        C5 = feat_dict.get("C5")
+        # Extract HRNet multi-resolution features
+        R4 = feat_dict.get("R4")
+        R8 = feat_dict.get("R8")
+        R16 = feat_dict.get("R16")
+        R32 = feat_dict.get("R32")
+
+        # Alias HRNet branches to "C3, C4, C5" for compatibility
+        C3, C4, C5 = R8, R16, R32
         
         # Initialize SFB on first forward pass
         if not self.initialized and C3 is not None:
@@ -53,15 +63,18 @@ class FeatureExtractionModel(nn.Module):
         # Pass through SFB
         if self.sfb is not None and C3 is not None and C4 is not None and C5 is not None:
             P3, P4, P5 = self.sfb([C3, C4, C5])
-            return {"C3": C3, "C4": C4, "C5": C5, "P3": P3, "P4": P4, "P5": P5}
+            return {"R4": R4, "R8": R8, "R16": R16, "R32": R32, "P3": P3, "P4": P4, "P5": P5}
         
-        return {"C3": C3, "C4": C4, "C5": C5}
+        return {"R4": R4, "R8": R8, "R16": R16, "R32": R32}
 
 
+# ---------------------------------------------------------------------- #
+# Losses
+# ---------------------------------------------------------------------- #
 def feature_reconstruction_loss(features):
     """
-    Self-supervised loss: Encourage features to be informative
-    Using variance and covariance to prevent collapse
+    Self-supervised loss:
+    Encourages feature diversity (variance) and channel independence (covariance)
     """
     total_loss = 0
     count = 0
@@ -70,19 +83,16 @@ def feature_reconstruction_loss(features):
         if feat is None:
             continue
         
-        # Reshape: (B, C, H, W) -> (B, C, H*W)
         B, C, H, W = feat.shape
         feat_flat = feat.view(B, C, -1)
         
-        # Variance loss: encourage diversity across spatial locations
+        # Variance term
         variance = feat_flat.var(dim=2).mean()
-        var_loss = torch.clamp(1.0 - variance, min=0)  # Penalty if variance < 1
+        var_loss = torch.clamp(1.0 - variance, min=0)
         
-        # Covariance loss: encourage independence between channels
+        # Covariance term
         feat_normalized = feat_flat - feat_flat.mean(dim=2, keepdim=True)
         cov_matrix = torch.bmm(feat_normalized, feat_normalized.transpose(1, 2)) / (H * W)
-        
-        # Off-diagonal elements should be small (independence)
         identity = torch.eye(C, device=feat.device).unsqueeze(0).expand(B, -1, -1)
         cov_loss = (cov_matrix - identity).pow(2).mean()
         
@@ -93,57 +103,40 @@ def feature_reconstruction_loss(features):
 
 
 def contrastive_feature_loss(P3, P4, P5):
-    """
-    Contrastive loss: Features at different scales should be different
-    but spatially aligned features should be similar
-    """
+    """Contrastive loss to balance feature similarity across pyramid scales"""
     if P3 is None or P4 is None or P5 is None:
         return torch.tensor(0.0)
     
-    # Downsample P3 and P4 to match P5 size
     P3_down = nn.functional.adaptive_avg_pool2d(P3, P5.shape[2:])
     P4_down = nn.functional.adaptive_avg_pool2d(P4, P5.shape[2:])
     
-    # Normalize features
     P3_norm = nn.functional.normalize(P3_down, dim=1)
     P4_norm = nn.functional.normalize(P4_down, dim=1)
     P5_norm = nn.functional.normalize(P5, dim=1)
     
-    # Similarity between scale pairs (should be moderate, not too similar)
     sim_3_4 = (P3_norm * P4_norm).sum(dim=1).mean()
     sim_4_5 = (P4_norm * P5_norm).sum(dim=1).mean()
     sim_3_5 = (P3_norm * P5_norm).sum(dim=1).mean()
     
-    # Target similarity around 0.5 (not too similar, not too different)
     target = 0.5
     loss = (sim_3_4 - target).pow(2) + (sim_4_5 - target).pow(2) + (sim_3_5 - target).pow(2)
-    
     return loss
 
 
+# ---------------------------------------------------------------------- #
+# Training
+# ---------------------------------------------------------------------- #
 def train_step(images, model, optimizer, device):
-    """Single training step"""
     images = images.to(device)
-    
     optimizer.zero_grad()
     
-    # Forward pass
     features = model(images)
-    
-    # Calculate losses
     recon_loss = feature_reconstruction_loss(features)
-    
-    # Contrastive loss between pyramid levels
     contrast_loss = contrastive_feature_loss(
-        features.get("P3"), 
-        features.get("P4"), 
-        features.get("P5")
+        features.get("P3"), features.get("P4"), features.get("P5")
     )
     
-    # Total loss
     total_loss = recon_loss + 0.1 * contrast_loss
-    
-    # Backward
     total_loss.backward()
     optimizer.step()
     
@@ -151,61 +144,43 @@ def train_step(images, model, optimizer, device):
 
 
 def train_epoch(train_loader, model, optimizer, device, epoch):
-    """Train for one epoch"""
     model.train()
-    total_loss = 0
-    recon_loss_sum = 0
-    contrast_loss_sum = 0
+    total_loss = recon_loss_sum = contrast_loss_sum = 0
     
     for batch_idx, (images, _) in enumerate(train_loader):
-        # Rescale images
         images = rescale_input(images, scale=(1 / 255), offset=0)
-        
-        # Train step
         loss, recon, contrast = train_step(images, model, optimizer, device)
-        
         total_loss += loss
         recon_loss_sum += recon
         contrast_loss_sum += contrast
         
-        # Print progress
         if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_loader):
-            avg_loss = total_loss / (batch_idx + 1)
-            avg_recon = recon_loss_sum / (batch_idx + 1)
-            avg_contrast = contrast_loss_sum / (batch_idx + 1)
             print(f"\rEpoch {epoch} [{batch_idx+1}/{len(train_loader)}] - "
-                  f"Loss: {avg_loss:.4f} (Recon: {avg_recon:.4f}, Contrast: {avg_contrast:.4f})", end="")
-    
-    print()  # New line after epoch
+                  f"Loss: {total_loss / (batch_idx+1):.4f} "
+                  f"(Recon: {recon_loss_sum / (batch_idx+1):.4f}, "
+                  f"Contrast: {contrast_loss_sum / (batch_idx+1):.4f})", end="")
+    print()
     return total_loss / len(train_loader)
 
 
 def validate(val_loader, model, device):
-    """Validate the model"""
     model.eval()
     total_loss = 0
-    
     with torch.no_grad():
         for images, _ in val_loader:
             images = rescale_input(images, scale=(1 / 255), offset=0)
             images = images.to(device)
-            
             features = model(images)
             recon_loss = feature_reconstruction_loss(features)
             contrast_loss = contrastive_feature_loss(
-                features.get("P3"), 
-                features.get("P4"), 
-                features.get("P5")
+                features.get("P3"), features.get("P4"), features.get("P5")
             )
-            
             loss = recon_loss + 0.1 * contrast_loss
             total_loss += loss.item()
-    
     return total_loss / len(val_loader)
 
 
 def train(train_loader, val_loader, model, optimizer, scheduler, device, epochs, save_dir):
-    """Main training loop"""
     os.makedirs(save_dir, exist_ok=True)
     best_val_loss = float('inf')
     
@@ -216,16 +191,13 @@ def train(train_loader, val_loader, model, optimizer, scheduler, device, epochs,
         print(f"\nEpoch {epoch}/{epochs}")
         print("-" * 70)
         
-        # Train
         train_loss = train_epoch(train_loader, model, optimizer, device, epoch)
         print(f"Training Loss: {train_loss:.4f}")
         
-        # Validate
         if val_loader:
             val_loss = validate(val_loader, model, device)
             print(f"Validation Loss: {val_loss:.4f}")
             
-            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 checkpoint_path = os.path.join(save_dir, "best_feature_model.pth")
@@ -237,15 +209,13 @@ def train(train_loader, val_loader, model, optimizer, scheduler, device, epochs,
                 }, checkpoint_path)
                 print(f"✓ Saved best model (val_loss: {val_loss:.4f})")
         
-        # Save checkpoint every epoch
-        checkpoint_path = os.path.join(save_dir, f"feature_model_epoch_{epoch}.pth")
+        # Save every epoch
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-        }, checkpoint_path)
+        }, os.path.join(save_dir, f"feature_model_epoch_{epoch}.pth"))
         
-        # Step scheduler
         if scheduler:
             scheduler.step()
             print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
@@ -256,9 +226,12 @@ def train(train_loader, val_loader, model, optimizer, scheduler, device, epochs,
     print(f"Best model saved at: {os.path.join(save_dir, 'best_feature_model.pth')}")
 
 
+# ---------------------------------------------------------------------- #
+# Main entry point
+# ---------------------------------------------------------------------- #
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Feature Extraction (Backbone + SFB)")
-    parser.add_argument("--backbone", type=str, default="hrnet_w32", help="Backbone architecture")
+    parser.add_argument("--backbone", type=str, default="hrnet_w48", help="Backbone architecture")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
@@ -266,7 +239,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Save directory")
     args = parser.parse_args()
     
-    # Device
+    # Device setup
     device = cfg.DEVICE
     print(f"Device: {device}")
     print(f"Backbone: {args.backbone}")
@@ -274,15 +247,17 @@ if __name__ == "__main__":
     print(f"Learning rate: {args.lr}")
     print(f"Batch size: {args.batch_size}")
     
-    # Check for pretrained weights
+    # Pretrained weights
     backbone_weights = args.pretrained
     if backbone_weights is None and args.backbone in ["hrnet_w32", "hrnet_w48"]:
         default_path = f"pretrained_weights/{args.backbone}_imagenet.pth"
         if os.path.exists(default_path):
             backbone_weights = default_path
             print(f"Using pretrained weights: {default_path}")
+        else:
+            print(f"⚠️ No pretrained weights found, using random initialization.")
     
-    # Create datasets
+    # Datasets
     print("\nLoading datasets...")
     train_dataset = Dataset(name="isbi", mode="train", batch_size=args.batch_size, shuffle=True)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
@@ -295,17 +270,15 @@ if __name__ == "__main__":
         val_loader = None
         print(f"Train samples: {len(train_dataset)}, No validation set")
     
-    # Create model
+    # Model
     print("\nCreating model...")
     model = FeatureExtractionModel(
         backbone_name=args.backbone,
         backbone_weights=backbone_weights
     ).to(device)
     
-    # Optimizer
+    # Optimizer + scheduler
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    
-    # Scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     
     # Train
