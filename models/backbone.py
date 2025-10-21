@@ -2,184 +2,152 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import os
+
 from .hrnet import HRNetBackbone
 
 
 class Backbone(nn.Module):
+    """
+    Unified backbone interface.
+    Supports: VGG, ResNet, DarkNet, HRNet.
+    For feature extraction, HRNet is preferred (R4, R8, R16, R32 outputs).
+    """
 
-    def __init__(
-        self,
-        name: str,
-        pretrained: bool = False,
-        weights_root_path: str = None
-    ):
-        super(Backbone, self).__init__()
-        
-        self.name = name
+    def __init__(self, name: str, pretrained: bool = False, weights_root_path: str = None):
+        super().__init__()
+        self.name = name.lower()
         self.is_hrnet = False
 
-        if name == "vgg16":
-            self.base_model = models.vgg16(pretrained=pretrained)
-            self.features = self.base_model.features
-            self.avgpool = self.base_model.avgpool
-            self.classifier = self.base_model.classifier
-        elif name == "vgg19":
-            self.base_model = models.vgg19(pretrained=pretrained)
-            self.features = self.base_model.features
-            self.avgpool = self.base_model.avgpool
-            self.classifier = self.base_model.classifier
-        elif name == "resnet18":
-            self.base_model = models.resnet18(pretrained=pretrained)
-            self.features = nn.Sequential(
-                self.base_model.conv1,
-                self.base_model.bn1,
-                self.base_model.relu,
-                self.base_model.maxpool,
-                self.base_model.layer1,
-                self.base_model.layer2,
-                self.base_model.layer3,
-                self.base_model.layer4
+        # ---------------- HRNet ----------------
+        if self.name in ["hrnet_w32", "hrnet_w48"]:
+            variant = "w32" if "w32" in self.name else "w48"
+            self.base_model = HRNetBackbone(
+                variant=variant,
+                pretrained=pretrained,
+                weights_path=weights_root_path,
+                use_c_heads=False  # ✅ pure feature extraction only
             )
-        elif name == "resnet34":
-            self.base_model = models.resnet34(pretrained=pretrained)
-            self.features = nn.Sequential(
-                self.base_model.conv1,
-                self.base_model.bn1,
-                self.base_model.relu,
-                self.base_model.maxpool,
-                self.base_model.layer1,
-                self.base_model.layer2,
-                self.base_model.layer3,
-                self.base_model.layer4
-            )
-        elif name == "resnet50":
-            self.base_model = models.resnet50(pretrained=pretrained)
-            self.features = nn.Sequential(
-                self.base_model.conv1,
-                self.base_model.bn1,
-                self.base_model.relu,
-                self.base_model.maxpool,
-                self.base_model.layer1,
-                self.base_model.layer2,
-                self.base_model.layer3,
-                self.base_model.layer4
-            )
-        elif name == "darknet19":
-            # Custom DarkNet19 implementation for PyTorch
-            self.features = self._make_darknet19_layers()
-        elif name == "darknet53":
-            # Custom DarkNet53 implementation for PyTorch
-            self.features = self._make_darknet53_layers()
-        elif name in ["hrnet_w32", "hrnet_w48"]:
-            # HRNet backbone
-            variant = "w32" if name == "hrnet_w32" else "w48"
-            self.base_model = HRNetBackbone(variant=variant, pretrained=pretrained, weights_path=weights_root_path)
             self.is_hrnet = True
-        else:
-            raise ValueError(f"'{name}' no such backbone exists.")
+            return  # HRNet initialized; skip below
 
-        # Load weights if path provided (but not for HRNet, which loads in its own __init__)
+        # ---------------- VGG ----------------
+        elif self.name == "vgg16":
+            model = models.vgg16(pretrained=pretrained)
+            self.features = model.features
+
+        elif self.name == "vgg19":
+            model = models.vgg19(pretrained=pretrained)
+            self.features = model.features
+
+        # ---------------- ResNet ----------------
+        elif self.name == "resnet18":
+            model = models.resnet18(pretrained=pretrained)
+            self.features = nn.Sequential(
+                model.conv1, model.bn1, model.relu, model.maxpool,
+                model.layer1, model.layer2, model.layer3, model.layer4
+            )
+
+        elif self.name == "resnet34":
+            model = models.resnet34(pretrained=pretrained)
+            self.features = nn.Sequential(
+                model.conv1, model.bn1, model.relu, model.maxpool,
+                model.layer1, model.layer2, model.layer3, model.layer4
+            )
+
+        elif self.name == "resnet50":
+            model = models.resnet50(pretrained=pretrained)
+            self.features = nn.Sequential(
+                model.conv1, model.bn1, model.relu, model.maxpool,
+                model.layer1, model.layer2, model.layer3, model.layer4
+            )
+
+        # ---------------- DarkNet (optional minimal stubs) ----------------
+        elif self.name == "darknet19":
+            self.features = self._make_darknet19_layers()
+        elif self.name == "darknet53":
+            self.features = self._make_darknet53_layers()
+
+        else:
+            raise ValueError(f"Unsupported backbone: {self.name}")
+
+        # ---------------- Load custom weights if provided ----------------
         if weights_root_path is not None and not self.is_hrnet:
             if os.path.isfile(weights_root_path):
                 self.load_weights(weights_root_path)
             else:
-                raise ValueError(f"'{weights_root_path}' no such file.")
+                raise FileNotFoundError(f"Weights file not found: {weights_root_path}")
 
+    # ---------------------------------------------------------------------
+    # Custom lightweight DarkNet placeholders
+    # ---------------------------------------------------------------------
     def _make_darknet19_layers(self):
-        # Simplified DarkNet19 implementation
-        layers = []
-        layers.append(nn.Conv2d(3, 32, 3, padding=1))
-        layers.append(nn.BatchNorm2d(32))
-        layers.append(nn.LeakyReLU(0.1))
+        layers = [
+            nn.Conv2d(3, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1)
+        ]
         return nn.Sequential(*layers)
 
     def _make_darknet53_layers(self):
-        # Simplified DarkNet53 implementation
-        layers = []
-        layers.append(nn.Conv2d(3, 32, 3, padding=1))
-        layers.append(nn.BatchNorm2d(32))
-        layers.append(nn.LeakyReLU(0.1))
+        layers = [
+            nn.Conv2d(3, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1)
+        ]
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    # ---------------------------------------------------------------------
+    # Forward pass
+    # ---------------------------------------------------------------------
+    def forward(self, x: torch.Tensor):
+        """Run the backbone forward."""
         if self.is_hrnet:
             return self.base_model(x)
         return self.features(x)
 
-    def get_layer_output(self, layer_name):
-        """Get output from a specific layer"""
-        if hasattr(self, 'base_model'):
-            if "vgg" in layer_name:
-                return self._get_vgg_layer_output(x, layer_name)
-            elif "resnet" in layer_name:
-                return self._get_resnet_layer_output(x, layer_name)
-        return None
-
-    def _get_vgg_layer_output(self, x, layer_name):
-        """Extract VGG layer outputs"""
-        features = []
-        for i, layer in enumerate(self.features):
-            x = layer(x)
-            if str(i) in layer_name:
-                features.append(x)
-        return features
-
-    def _get_resnet_layer_output(self, x, layer_name):
-        """Extract ResNet layer outputs"""
-        features = []
-        x = self.base_model.conv1(x)
-        x = self.base_model.bn1(x)
-        x = self.base_model.relu(x)
-        x = self.base_model.maxpool(x)
-        
-        x = self.base_model.layer1(x)
-        features.append(x)  # C2
-        
-        x = self.base_model.layer2(x)
-        features.append(x)  # C3
-        
-        x = self.base_model.layer3(x)
-        features.append(x)  # C4
-        
-        x = self.base_model.layer4(x)
-        features.append(x)  # C5
-        
-        return features
-
-    def load_weights(self, path: str):
-        if self.is_hrnet:
-            # Delegate to HRNet backbone
-            self.base_model.load_weights(path)
-        else:
-            checkpoint = torch.load(path, map_location='cpu')
-            if 'state_dict' in checkpoint:
-                self.load_state_dict(checkpoint['state_dict'])
-            else:
-                self.load_state_dict(checkpoint)
-
-    def save_weights(self, path):
-        torch.save(self.state_dict(), path)
-
-    def freeze(self):
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def unfreeze(self):
-        for param in self.parameters():
-            param.requires_grad = True
-
-    def summary(self):
-        print(self)
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-
+    # ---------------------------------------------------------------------
+    # Feature dictionary access
+    # ---------------------------------------------------------------------
     def get_feature_dict(self):
-        """Return a dict of intermediate features if available.
-        For HRNet, returns the multi-resolution dict produced in forward.
-        For torchvision backbones, returns None (hooks are used elsewhere).
-        """
-        if self.is_hrnet and hasattr(self.base_model, 'get_feature_dict'):
+        """Return HRNet multi-scale features if available."""
+        if self.is_hrnet and hasattr(self.base_model, "get_feature_dict"):
             return self.base_model.get_feature_dict()
         return None
+
+    # ---------------------------------------------------------------------
+    # Weight utilities
+    # ---------------------------------------------------------------------
+    def load_weights(self, path: str):
+        """Load model weights (supports HRNet and torchvision)."""
+        if self.is_hrnet:
+            self.base_model.load_weights(path)
+        else:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            self.load_state_dict(state_dict, strict=False)
+            print(f"✓ Loaded weights from {path}")
+
+    def save_weights(self, path: str):
+        """Save current weights."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(self.state_dict(), path)
+        print(f"✓ Saved weights to {path}")
+
+    # ---------------------------------------------------------------------
+    # Utility methods
+    # ---------------------------------------------------------------------
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def unfreeze(self):
+        for p in self.parameters():
+            p.requires_grad = True
+
+    def summary(self):
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"\nBackbone: {self.name}")
+        print(f"Total params: {total_params:,}")
+        print(f"Trainable: {trainable:,}")
+        print(self)
