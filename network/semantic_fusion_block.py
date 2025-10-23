@@ -41,16 +41,21 @@ class SemanticFusionBlock(nn.Module):
         """
         R8, R16, R32 = inputs
 
-        # Step 1: lateral projections
-        L8 = self.relu(self.lateral3(R8))
-        L16 = self.relu(self.lateral4(R16))
-        L32 = self.relu(self.lateral5(R32))
+        # Step 1: lateral projections (reduce channels to num_filters)
+        L8 = self.lateral3(R8)
+        L16 = self.lateral4(R16)
+        L32 = self.lateral5(R32)
 
-        # Step 2: top-down fusion
-        P5 = self.bn5(self.refine5(L32))                    # 1/32
-        up_p5 = self.upsample(L32)                          # to 1/16
-        P4 = self.bn4(self.refine4(self.relu(L16 + up_p5))) # 1/16
-        up_p4 = self.upsample(L16 + up_p5)                  # to 1/8
-        P3 = self.bn3(self.refine3(self.relu(L8 + up_p4)))  # 1/8
+        # Step 2: top-down fusion with cumulative feature aggregation
+        # P5: coarsest level (1/32)
+        P5 = self.relu(self.bn5(self.refine5(L32)))
+        
+        # P4: middle level (1/16) - uses upsampled L32 (not P5)
+        up_p5 = self.upsample(L32)
+        P4 = self.relu(self.bn4(self.refine4(L16 + up_p5)))
+        
+        # P3: finest level (1/8) - uses cumulative upsampled features
+        up_p4 = self.upsample(L16 + up_p5)
+        P3 = self.relu(self.bn3(self.refine3(L8 + up_p4)))
 
         return P3, P4, P5
