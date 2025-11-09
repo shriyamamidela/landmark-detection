@@ -2,6 +2,7 @@
 """
 Feature Extraction Analysis Script (HRNet-W48 Compatible)
 Visualizes intermediate outputs from input image → HRNet backbone → Semantic Fusion Block (SFB)
+Now loads your trained checkpoint (checkpoints/best_feature_model.pth)
 """
 
 import torch
@@ -24,7 +25,6 @@ def load_isbi_image_and_landmarks(image_path, annotation_path):
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Could not load image: {image_path}")
-
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     with open(annotation_path, 'r') as f:
@@ -46,9 +46,9 @@ def load_isbi_image_and_landmarks(image_path, annotation_path):
 MAX_FEATURES = 8
 NORMALIZE = 'percentile'
 PCLIP_LOW, PCLIP_HIGH = 2.0, 98.0
-INTERP = 'cubic'
+INTERP = 'nearest'     # changed to prevent smoothing
 UPSAMPLE = True
-SHARPEN = 0.5
+SHARPEN = 1.0          # increased to improve feature clarity
 CMAP = 'gray'
 TOPK_BY = 'l2'
 
@@ -64,27 +64,16 @@ def _unsharp(image, amount=0.0):
 # --------------------- #
 # Feature Map Visualizer
 # --------------------- #
-def visualize_feature_maps(
-    feature_maps,
-    title,
-    save_path=None,
-    max_features=16,
-    upsample_to=None,
-    normalize='minmax',
-    cmap='gray',
-    topk_by='l2',
-    interp='nearest',
-    sharpen=0.0,
-    also_save_composite=False
-):
+def visualize_feature_maps(feature_maps, title, save_path=None, max_features=16,
+                           upsample_to=None, normalize='minmax', cmap='gray',
+                           topk_by='l2', interp='nearest', sharpen=0.0):
     if isinstance(feature_maps, torch.Tensor):
         feature_maps = feature_maps.detach().cpu().numpy()
-
     if len(feature_maps.shape) == 4:
         feature_maps = feature_maps[0]
-    num_channels = feature_maps.shape[0]
 
-    # Rank channels
+    num_channels = feature_maps.shape[0]
+    # Rank channels by activation
     if topk_by == 'l2':
         scores = (feature_maps ** 2).mean(axis=(1, 2))
     elif topk_by == 'l1':
@@ -104,11 +93,7 @@ def visualize_feature_maps(
     for i in range(num_features):
         r, c = i // cols, i % cols
         fmap = feature_maps[i]
-        if normalize == 'zscore':
-            mu, sigma = fmap.mean(), fmap.std() + 1e-8
-            fmap = (fmap - mu) / sigma
-            fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
-        elif normalize == 'percentile':
+        if normalize == 'percentile':
             lo, hi = np.percentile(fmap, PCLIP_LOW), np.percentile(fmap, PCLIP_HIGH)
             fmap = np.clip((fmap - lo) / (hi - lo + 1e-8), 0, 1)
         else:
@@ -116,7 +101,7 @@ def visualize_feature_maps(
 
         if upsample_to is not None:
             H, W = upsample_to
-            inter = cv2.INTER_CUBIC if interp == 'cubic' else cv2.INTER_NEAREST
+            inter = cv2.INTER_NEAREST if interp == 'nearest' else cv2.INTER_CUBIC
             fmap = cv2.resize(fmap, (W, H), interpolation=inter)
 
         fmap = _unsharp(fmap, amount=sharpen)
@@ -138,7 +123,7 @@ def visualize_feature_maps(
 # --------------------- #
 # Main analysis function
 # --------------------- #
-def analyze_feature_extraction(backbone_name: str = "hrnet_w48", pretrained_weights: str = None):
+def analyze_feature_extraction(backbone_name="hrnet_w48", pretrained_weights=None):
     print("=" * 70)
     print("🔍 HRNet Feature Extraction Analysis (HRNet-W48)")
     print("=" * 70)
@@ -164,24 +149,36 @@ def analyze_feature_extraction(backbone_name: str = "hrnet_w48", pretrained_weig
 
     # Preprocess input
     image_tensor = torch.from_numpy(resized_image).float().permute(2, 0, 1).unsqueeze(0).to(device)
-    image_tensor = image_tensor / 255.0
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    image_tensor = (image_tensor - mean) / std
+    image_tensor = (image_tensor / 255.0 - torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)) \
+                   / torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-    # Create HRNet backbone
     print("\nCreating HRNet-W48 backbone...")
-    backbone_weights_path = pretrained_weights if pretrained_weights and os.path.exists(pretrained_weights) else None
-    if backbone_weights_path:
-        print(f"Using pretrained weights: {backbone_weights_path}")
+
+    # ✅ Load trained model instead of ImageNet
+    trained_ckpt = "checkpoints/best_feature_model.pth"
+    if os.path.exists(trained_ckpt):
+        print(f"✅ Using trained checkpoint: {trained_ckpt}")
+        checkpoint = torch.load(trained_ckpt, map_location=device)
+        pretrained_weights = None  # override ImageNet weights
     else:
-        print("⚠️ No pretrained weights found — using random initialization.")
+        print("⚠️ Trained checkpoint not found, falling back to ImageNet weights.")
+        checkpoint = None
 
     network = Network(
         backbone_name=backbone_name,
         freeze_backbone=False,
-        backbone_weights=backbone_weights_path
+        backbone_weights=pretrained_weights
     ).to(device)
+
+    # Load model weights if available
+    if checkpoint is not None:
+        if "model_state_dict" in checkpoint:
+            network.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            print("✅ Loaded weights from trained model checkpoint.")
+        else:
+            network.load_state_dict(checkpoint, strict=False)
+            print("✅ Loaded weights directly from checkpoint file.")
+
     network.eval()
 
     with torch.no_grad():
@@ -205,7 +202,6 @@ def analyze_feature_extraction(backbone_name: str = "hrnet_w48", pretrained_weig
                         topk_by=TOPK_BY,
                         interp=INTERP,
                         sharpen=SHARPEN,
-                        also_save_composite=True,
                     )
 
             # Semantic Fusion Block
@@ -228,7 +224,6 @@ def analyze_feature_extraction(backbone_name: str = "hrnet_w48", pretrained_weig
                         topk_by=TOPK_BY,
                         interp=INTERP,
                         sharpen=SHARPEN,
-                        also_save_composite=True,
                     )
         else:
             print("❌ No HRNet features extracted.")
@@ -244,7 +239,7 @@ if __name__ == "__main__":
     os.makedirs("outputs", exist_ok=True)
     parser = argparse.ArgumentParser(description="Feature Extraction Analysis (HRNet-W48)")
     parser.add_argument("--backbone", type=str, default="hrnet_w48", help="Backbone architecture")
-    parser.add_argument("--pretrained", type=str, default="pretrained_weights/hrnet_w48_imagenet.pth", help="Path to pretrained weights")
+    parser.add_argument("--pretrained", type=str, default="pretrained_weights/hrnet_w48_imagenet.pth", help="Fallback to ImageNet if no checkpoint")
     parser.add_argument("--max-features", type=int, default=MAX_FEATURES)
     parser.add_argument("--normalize", type=str, default=NORMALIZE)
     parser.add_argument("--interp", type=str, default=INTERP)
