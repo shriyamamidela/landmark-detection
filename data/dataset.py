@@ -1,5 +1,6 @@
 from data import ISBIDataset, PKUDataset
 from preprocessing import Augmentation
+from preprocessing.utils import generate_distance_transform  # ✅ make sure this exists
 from paths import Paths
 import torch
 from torch.utils.data import Dataset as TorchDataset
@@ -10,6 +11,7 @@ import os
 
 
 def resize(image: np.ndarray, landmarks: np.ndarray):
+    """Resize image and landmarks to match cfg.HEIGHT, cfg.WIDTH."""
     image_height, image_width = image.shape[0:2]
     ratio_height, ratio_width = (image_height / cfg.HEIGHT), (image_width / cfg.WIDTH)
 
@@ -68,29 +70,46 @@ class Dataset(TorchDataset):
         return len(self.dataset)
 
     def __getitem__(self, index: int):
-        image, landmarks = self.dataset[index]
+      image, landmarks = self.dataset[index]
 
-        # Apply augmentation if available
-        if self.augmentation is not None:
-            image, landmarks = self.augmentation.apply(image, landmarks)
+      # Apply augmentation if available
+      if self.augmentation is not None:
+          image, landmarks = self.augmentation.apply(image, landmarks)
 
-        # Resize image and landmarks to cfg-defined size
-        image, landmarks = resize(image, landmarks)
+      # Resize image and landmarks to cfg-defined size
+      image, landmarks = resize(image, landmarks)
 
-        # Convert to PyTorch tensors (channels-first format)
-        image = torch.from_numpy(image).float().permute(2, 0, 1)  # (H, W, C) → (C, H, W)
-        landmarks = torch.from_numpy(landmarks).float()
+      # Ensure 3 channels (drop alpha / expand grayscale)
+      if image.ndim == 2:
+          image = np.repeat(image[:, :, None], 3, axis=2)
+      elif image.shape[-1] == 4:
+          image = image[:, :, :3]
 
-        return image, landmarks
+      # ✅ Generate DT map
+      # ✅ Generate DT map
+      from preprocessing.utils import generate_distance_transform
+      dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH))
+      if dt_map.ndim == 2:
+          dt_map = np.expand_dims(dt_map.astype(np.float32), axis=0)  # (1, H, W)
+      else:
+          dt_map = dt_map.astype(np.float32)  # keep as (1, H, W)
+
+      # Convert to PyTorch tensors
+      image = torch.from_numpy(image).float().permute(2, 0, 1)  # (C, H, W)
+      landmarks = torch.from_numpy(landmarks).float()
+      dt_map = torch.from_numpy(dt_map).float()
+
+      # ✅ Return 3-tuple (image, landmarks, dt_map)
+      return image, landmarks, dt_map
 
     def get_batch(self, indices):
         """Get a batch of data"""
-        images = []
-        labels = []
+        images, labels, dt_maps = [], [], []
 
         for idx in indices:
-            image, landmarks = self[idx]
+            image, landmarks, dt_map = self[idx]
             images.append(image)
             labels.append(landmarks)
+            dt_maps.append(dt_map)
 
-        return torch.stack(images), torch.stack(labels)
+        return torch.stack(images), torch.stack(labels), torch.stack(dt_maps)
