@@ -1,11 +1,13 @@
-from preprocessing.utils import identity, high_pass_filtering, solarization, unsharp_masking, inversion, \
-    contrast_limited_histogram_equalization, horizontal_flip, random_cropping, vertical_shift
+from preprocessing.utils import (
+    identity, high_pass_filtering, solarization, unsharp_masking, inversion,
+    contrast_limited_histogram_equalization, horizontal_flip, random_cropping, vertical_shift,
+    generate_edge_map, generate_distance_transform
+)
 from config import cfg
 import numpy as np
 
 
 class Augmentation(object):
-
     def __init__(
         self,
         highpass_filter: bool = False,
@@ -16,8 +18,11 @@ class Augmentation(object):
         random_flip: bool = False,
         random_shift: bool = False,
         random_crop: bool = False,
-        landmark_shift: bool = False
+        landmark_shift: bool = False,
+        add_edges: bool = True,       # optional: keep for future edge map generation
+        generate_dt: bool = True      # optional: controlled outside dataset now
     ):
+        # Photometric transformations
         self.photometric_transformations = [identity]
         if highpass_filter:
             self.photometric_transformations.append(high_pass_filtering)
@@ -30,6 +35,7 @@ class Augmentation(object):
         if clahe:
             self.photometric_transformations.append(contrast_limited_histogram_equalization)
 
+        # Geometric transformations
         self.geometric_transformations = []
         if random_flip:
             self.geometric_transformations.append(horizontal_flip)
@@ -38,21 +44,29 @@ class Augmentation(object):
         if random_crop:
             self.geometric_transformations.append(random_cropping)
 
+        # Other flags
         self.landmark_shift = landmark_shift
+        self.add_edges = add_edges
+        self.generate_dt = generate_dt
 
+    # --------------------------------------------------------------- #
+    # ✅ Add this part — apply() must exist
+    # --------------------------------------------------------------- #
     def apply(self, image: np.ndarray, landmarks: np.ndarray):
-        # Photometric Transformation
-        photometric_transforma_fn = np.random.choice(self.photometric_transformations)
-        image = photometric_transforma_fn(image)
+        """Apply photometric + geometric + optional landmark transformations."""
 
-        # Geometric Transformation
+        # Photometric Transformation
+        photometric_transform_fn = np.random.choice(self.photometric_transformations)
+        image = photometric_transform_fn(image)
+
+        # Geometric Transformations
         np.random.shuffle(self.geometric_transformations)
         for geometric_transform_fn in self.geometric_transformations:
             prob = np.random.uniform()
             if prob < 0.5:
                 image, landmarks = geometric_transform_fn(image, landmarks)
 
-        # Cephalometric Transformations
+        # Cephalometric Landmark Perturbation
         choice = np.random.uniform()
         if 0.0 < choice < 0.25 and self.landmark_shift:
             transformed_landmarks = np.zeros_like(landmarks)
@@ -60,4 +74,5 @@ class Augmentation(object):
             transformed_landmarks[:, 1] = landmarks[:, 1] - np.random.randint(-10, 10, cfg.NUM_LANDMARKS)
             landmarks = transformed_landmarks
 
+        # ✅ Return ONLY image and landmarks
         return image, landmarks
