@@ -1,1 +1,1 @@
-from models.backbone import Backbone
+from models.backbone import ResNetBackbone
