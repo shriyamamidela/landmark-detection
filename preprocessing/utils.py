@@ -1,3 +1,4 @@
+# preprocessing/utils.py
 from typing import Union
 import torch
 from config import cfg
@@ -5,8 +6,11 @@ import numpy as np
 import math
 import cv2
 import os
+from scipy.ndimage import distance_transform_edt
 
-
+# -------------------------
+# Existing utility functions (kept)
+# -------------------------
 def craniofacial_region_proposals(
     landmarks: Union[torch.Tensor, np.ndarray],
     image_height: int,
@@ -213,3 +217,82 @@ def visualize_landmarks(
         cv2.imwrite(save_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
     
     return image
+
+# -------------------------
+# New helpers required by the pipeline
+# -------------------------
+def generate_edge_bank(image: np.ndarray, out_channels: int = 3):
+    """
+    Create a simple 'edge bank' from the input RGB image.
+    Returns HxWx3 uint8 in range [0,255].
+    Channels:
+      - channel 0: Canny edges
+      - channel 1: Sobel magnitude
+      - channel 2: Laplacian (or morphological edges fallback)
+    This is intentionally simple and fast; replace with steerable / Frangi if you add the dependency.
+    """
+    if image.dtype != np.uint8:
+        img = np.clip(image, 0, 255).astype(np.uint8)
+    else:
+        img = image
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Canny
+    canny = cv2.Canny(gray, 50, 150)
+
+    # Sobel magnitude
+    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    sobel = np.sqrt(sx**2 + sy**2)
+    sobel = np.uint8(np.clip((sobel / (sobel.max()+1e-6)) * 255.0, 0, 255))
+
+    # Laplacian
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    lap = np.uint8(np.clip((np.abs(lap) / (np.abs(lap).max()+1e-6)) * 255.0, 0, 255))
+
+    bank = np.stack([canny, sobel, lap], axis=-1)  # H,W,3
+    if out_channels != 3:
+        # simple channel adjustments (repeat / truncate)
+        if out_channels < 3:
+            bank = bank[:, :, :out_channels]
+        else:
+            bank = np.tile(bank[:, :, :1], (1, 1, out_channels))
+
+    return bank  # uint8 HxWxC
+
+def generate_distance_transform(landmarks: np.ndarray, size: tuple):
+    """
+    landmarks: (N,2) in pixel coordinates relative to target size OR in the same coord system used
+    size: (H, W)
+    Returns: numpy array shape (1, H, W) float32 normalized [0, 1]
+    """
+    H, W = size
+    heat = np.zeros((H, W), dtype=np.uint8)
+
+    # If landmarks appear normalized (0..1), convert
+    lm = np.array(landmarks, dtype=np.float32)
+    if lm.max() <= 1.0:
+        lm[:, 0] = lm[:, 0] * W
+        lm[:, 1] = lm[:, 1] * H
+
+    for (x, y) in lm:
+        xi = int(round(x))
+        yi = int(round(y))
+        if 0 <= yi < H and 0 <= xi < W:
+            heat[yi, xi] = 1
+
+    # small gaussian blur so points occupy small area (helps DT stability)
+    heat = cv2.GaussianBlur(heat.astype(np.float32), (7, 7), 0)
+    # Normalize to [0,1] then invert for distance transform (distance from landmark)
+    binary = (heat > 1e-6).astype(np.uint8)
+    dt = distance_transform_edt(1 - binary)
+    # Normalize to 0..1 (optionally invert so closer = larger value)
+    if dt.max() > 0:
+        dt = dt.astype(np.float32) / (dt.max() + 1e-8)
+        # make closer to landmark have larger values (optional): invert
+        dt = 1.0 - dt
+    else:
+        dt = np.zeros_like(dt, dtype=np.float32)
+
+    return np.expand_dims(dt.astype(np.float32), axis=0)  # shape (1, H, W)
