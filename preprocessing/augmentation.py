@@ -1,78 +1,53 @@
-from preprocessing.utils import (
-    identity, high_pass_filtering, solarization, unsharp_masking, inversion,
-    contrast_limited_histogram_equalization, horizontal_flip, random_cropping, vertical_shift,
-    generate_edge_map, generate_distance_transform
-)
-from config import cfg
 import numpy as np
+from config import cfg
+from preprocessing.utils import generate_edge_bank  # ✅ only import existing function
 
 
+# -------------------- #
+# Utility transforms
+# -------------------- #
+def identity(image):
+    """No-op transformation."""
+    return image
+
+
+def horizontal_flip(image, landmarks):
+    """Simple horizontal flip."""
+    image_height, image_width = image.shape[:2]
+    flipped_image = np.ascontiguousarray(image[:, ::-1, :])
+    flipped_landmarks = landmarks.copy()
+    flipped_landmarks[:, 0] = image_width - landmarks[:, 0]
+    return flipped_image, flipped_landmarks
+
+
+# -------------------- #
+# Main Augmentation class
+# -------------------- #
 class Augmentation(object):
+    """
+    Minimal augmentation wrapper for cephalometric dataset.
+    Includes optional geometric jitter and edge-map fusion compatibility.
+    """
+
     def __init__(
         self,
-        highpass_filter: bool = False,
-        unsharp_mask: bool = False,
-        solarize: bool = False,
-        invert: bool = False,
-        clahe: bool = False,
-        random_flip: bool = False,
-        random_shift: bool = False,
-        random_crop: bool = False,
+        random_flip: bool = True,
         landmark_shift: bool = False,
-        add_edges: bool = True,       # optional: keep for future edge map generation
-        generate_dt: bool = True      # optional: controlled outside dataset now
+        add_edges: bool = True
     ):
-        # Photometric transformations
-        self.photometric_transformations = [identity]
-        if highpass_filter:
-            self.photometric_transformations.append(high_pass_filtering)
-        if solarize:
-            self.photometric_transformations.append(solarization)
-        if unsharp_mask:
-            self.photometric_transformations.append(unsharp_masking)
-        if invert:
-            self.photometric_transformations.append(inversion)
-        if clahe:
-            self.photometric_transformations.append(contrast_limited_histogram_equalization)
-
-        # Geometric transformations
-        self.geometric_transformations = []
-        if random_flip:
-            self.geometric_transformations.append(horizontal_flip)
-        if random_shift:
-            self.geometric_transformations.append(vertical_shift)
-        if random_crop:
-            self.geometric_transformations.append(random_cropping)
-
-        # Other flags
+        self.random_flip = random_flip
         self.landmark_shift = landmark_shift
         self.add_edges = add_edges
-        self.generate_dt = generate_dt
 
-    # --------------------------------------------------------------- #
-    # ✅ Add this part — apply() must exist
-    # --------------------------------------------------------------- #
     def apply(self, image: np.ndarray, landmarks: np.ndarray):
-        """Apply photometric + geometric + optional landmark transformations."""
+        # optional random flip
+        if self.random_flip and np.random.rand() < 0.5:
+            image, landmarks = horizontal_flip(image, landmarks)
 
-        # Photometric Transformation
-        photometric_transform_fn = np.random.choice(self.photometric_transformations)
-        image = photometric_transform_fn(image)
+        # optional landmark perturbation
+        if self.landmark_shift and np.random.rand() < 0.25:
+            noise = np.random.randint(-10, 10, landmarks.shape)
+            landmarks = landmarks + noise
 
-        # Geometric Transformations
-        np.random.shuffle(self.geometric_transformations)
-        for geometric_transform_fn in self.geometric_transformations:
-            prob = np.random.uniform()
-            if prob < 0.5:
-                image, landmarks = geometric_transform_fn(image, landmarks)
-
-        # Cephalometric Landmark Perturbation
-        choice = np.random.uniform()
-        if 0.0 < choice < 0.25 and self.landmark_shift:
-            transformed_landmarks = np.zeros_like(landmarks)
-            transformed_landmarks[:, 0] = landmarks[:, 0] - np.random.randint(-10, 10, cfg.NUM_LANDMARKS)
-            transformed_landmarks[:, 1] = landmarks[:, 1] - np.random.randint(-10, 10, cfg.NUM_LANDMARKS)
-            landmarks = transformed_landmarks
-
-        # ✅ Return ONLY image and landmarks
+        # ✅ return only image and landmarks
         return image, landmarks
