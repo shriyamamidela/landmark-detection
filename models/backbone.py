@@ -1,165 +1,72 @@
+# models/backbone.py
 import torch
 import torch.nn as nn
 import torchvision.models as models
-import os
-from .hrnet import HRNetBackbone
+from preprocessing.utils import generate_edge_bank
+import cv2
+import numpy as np
 
 
-class Backbone(nn.Module):
-    def __init__(
-        self,
-        name: str,
-        pretrained: bool = False,
-        weights_root_path: str = None
-    ):
-        super(Backbone, self).__init__()
+class ResNetBackbone(nn.Module):
+    """
+    ResNet backbone that extracts multi-scale feature maps:
+      C2 (1/4), C3 (1/8), C4 (1/16), C5 (1/32)
+    Optionally fuses edge-bank (E) features from preprocessing.
+    """
 
-        self.name = name
-        self.is_hrnet = False
+    def __init__(self, name="resnet34", pretrained=True, fuse_edges=True):
+        super(ResNetBackbone, self).__init__()
+        assert name in ["resnet18", "resnet34", "resnet50"], "Supported: resnet18/34/50"
 
-        if name == "vgg16":
-            self.base_model = models.vgg16(pretrained=pretrained)
-            self.features = self.base_model.features
-            self.avgpool = self.base_model.avgpool
-            self.classifier = self.base_model.classifier
+        self.fuse_edges = fuse_edges
 
-        elif name == "vgg19":
-            self.base_model = models.vgg19(pretrained=pretrained)
-            self.features = self.base_model.features
-            self.avgpool = self.base_model.avgpool
-            self.classifier = self.base_model.classifier
-
-        elif name == "resnet18":
-            self.base_model = models.resnet18(pretrained=pretrained)
-            self.features = nn.Sequential(
-                self.base_model.conv1,
-                self.base_model.bn1,
-                self.base_model.relu,
-                self.base_model.maxpool,
-                self.base_model.layer1,
-                self.base_model.layer2,
-                self.base_model.layer3,
-                self.base_model.layer4
-            )
-
+        # ------------------------------
+        # Load torchvision backbone
+        # ------------------------------
+        if name == "resnet18":
+            net = models.resnet18(pretrained=pretrained)
         elif name == "resnet34":
-            self.base_model = models.resnet34(pretrained=pretrained)
-            self.features = nn.Sequential(
-                self.base_model.conv1,
-                self.base_model.bn1,
-                self.base_model.relu,
-                self.base_model.maxpool,
-                self.base_model.layer1,
-                self.base_model.layer2,
-                self.base_model.layer3,
-                self.base_model.layer4
-            )
-
-        elif name == "resnet50":
-            self.base_model = models.resnet50(pretrained=pretrained)
-            self.features = nn.Sequential(
-                self.base_model.conv1,
-                self.base_model.bn1,
-                self.base_model.relu,
-                self.base_model.maxpool,
-                self.base_model.layer1,
-                self.base_model.layer2,
-                self.base_model.layer3,
-                self.base_model.layer4
-            )
-
-        elif name == "darknet19":
-            self.features = self._make_darknet19_layers()
-
-        elif name == "darknet53":
-            self.features = self._make_darknet53_layers()
-
-        elif name in ["hrnet_w32", "hrnet_w48"]:
-            # ✅ HRNet backbone (auto-select variant)
-            variant = "w32" if name == "hrnet_w32" else "w48"
-            print(f"Creating HRNet backbone ({variant.upper()})...")
-            self.base_model = HRNetBackbone(
-                variant=variant,
-                pretrained=pretrained,
-                weights_path=weights_root_path
-            )
-            self.is_hrnet = True
-
-            if weights_root_path and os.path.isfile(weights_root_path):
-                print(f"✓ Loaded pretrained HRNet-{variant.upper()} weights from {weights_root_path}")
-            else:
-                print(f"⚠️ No pretrained weights found — using random initialization.")
-
+            net = models.resnet34(pretrained=pretrained)
         else:
-            raise ValueError(f"'{name}' no such backbone exists.")
+            net = models.resnet50(pretrained=pretrained)
 
-        # Load non-HRNet weights manually (if path provided)
-        if weights_root_path is not None and not self.is_hrnet:
-            if os.path.isfile(weights_root_path):
-                self.load_weights(weights_root_path)
-            else:
-                raise ValueError(f"'{weights_root_path}' no such file.")
+        # Keep only the feature extractor layers
+        self.stem = nn.Sequential(
+            net.conv1, net.bn1, net.relu, net.maxpool
+        )
+        self.layer1 = net.layer1  # 1/4 resolution (C2)
+        self.layer2 = net.layer2  # 1/8 (C3)
+        self.layer3 = net.layer3  # 1/16 (C4)
+        self.layer4 = net.layer4  # 1/32 (C5)
 
-    # ---------------------------------------------------------------------- #
-    # Simplified DarkNet placeholder layers
-    # ---------------------------------------------------------------------- #
-    def _make_darknet19_layers(self):
-        layers = [
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.1)
-        ]
-        return nn.Sequential(*layers)
+        # Reduce channel dimension if we concatenate edge maps
+        if self.fuse_edges:
+            # input channels: original 3 + edge_bank channels (3) = 6
+            self.edge_conv = nn.Conv2d(6, 3, kernel_size=3, padding=1)  # fuse RGB+edges -> 3 channels
 
-    def _make_darknet53_layers(self):
-        layers = [
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.1)
-        ]
-        return nn.Sequential(*layers)
-
-    # ---------------------------------------------------------------------- #
-    # Forward and utilities
-    # ---------------------------------------------------------------------- #
     def forward(self, x):
-        if self.is_hrnet:
-            return self.base_model(x)
-        return self.features(x)
+        # x expected in range [0,1] float, shape (B,3,H,W)
+        if self.fuse_edges:
+            edge_maps = []
+            for img in x:
+                # move to cpu numpy uint8 BGR for consistent cv2 ops
+                img_np = (img.detach().cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+                # generate edge bank (HxWx3 uint8)
+                edge = generate_edge_bank(img_np)
+                # convert to float [0,1]
+                edge_tensor = torch.from_numpy(edge.astype(np.float32).transpose(2, 0, 1) / 255.0).to(x.device)
+                edge_maps.append(edge_tensor)
+            edge_stack = torch.stack(edge_maps, dim=0)  # (B, C_edge, H, W)
+            # concat along channel dimension (rgb + edges)
+            x = torch.cat([x, edge_stack], dim=1)  # (B, 6, H, W)
+            # reduce channels to 3 so ResNet stem conv works (it expects 3 channels)
+            x = self.edge_conv(x)
 
-    def load_weights(self, path: str):
-        """Generic weight loader for non-HRNet backbones."""
-        if self.is_hrnet:
-            self.base_model.load_weights(path)
-        else:
-            checkpoint = torch.load(path, map_location='cpu')
-            if 'state_dict' in checkpoint:
-                self.load_state_dict(checkpoint['state_dict'])
-            else:
-                self.load_state_dict(checkpoint)
-            print(f"✓ Loaded non-HRNet backbone weights from {path}")
+        # Pass through ResNet layers
+        x = self.stem(x)
+        c2 = self.layer1(x)
+        c3 = self.layer2(c2)
+        c4 = self.layer3(c3)
+        c5 = self.layer4(c4)
 
-    def save_weights(self, path):
-        torch.save(self.state_dict(), path)
-        print(f"✓ Saved backbone weights to {path}")
-
-    def freeze(self):
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def unfreeze(self):
-        for param in self.parameters():
-            param.requires_grad = True
-
-    def summary(self):
-        print(self)
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-
-    def get_feature_dict(self):
-        """Return HRNet's multi-resolution features if available."""
-        if self.is_hrnet and hasattr(self.base_model, 'get_feature_dict'):
-            return self.base_model.get_feature_dict()
-        return None
+        return {"C2": c2, "C3": c3, "C4": c4, "C5": c5}
