@@ -57,10 +57,9 @@ class Dataset(TorchDataset):
         elif self.mode == "train":
             print("✅ Enabling default augmentation for training mode")
             self.augmentation = Augmentation(
-                clahe=True,          # Contrast enhancement
-                random_flip=True,    # Random horizontal flips
-                random_shift=True,   # Landmark-preserving translation
-                unsharp_mask=True    # Edge sharpening
+                random_flip=True,
+                landmark_shift=True,
+                add_edges=True
             )
         else:
             self.augmentation = None
@@ -70,46 +69,39 @@ class Dataset(TorchDataset):
         return len(self.dataset)
 
     def __getitem__(self, index: int):
-      image, landmarks = self.dataset[index]
+        image, landmarks = self.dataset[index]
 
-      # Apply augmentation if available
-      if self.augmentation is not None:
-          image, landmarks = self.augmentation.apply(image, landmarks)
+        # Apply augmentation if available
+        if self.augmentation is not None:
+            image, landmarks = self.augmentation.apply(image, landmarks)
 
-      # Resize image and landmarks to cfg-defined size
-      image, landmarks = resize(image, landmarks)
+        # Resize image and landmarks
+        image, landmarks = resize(image, landmarks)
 
-      # Ensure 3 channels (drop alpha / expand grayscale)
-      if image.ndim == 2:
-          image = np.repeat(image[:, :, None], 3, axis=2)
-      elif image.shape[-1] == 4:
-          image = image[:, :, :3]
+        # Ensure 3 channels (drop alpha / expand grayscale)
+        if image.ndim == 2:
+            image = np.repeat(image[:, :, None], 3, axis=2)
+        elif image.shape[-1] == 4:
+            image = image[:, :, :3]
 
-      # ✅ Generate DT map
-      # ✅ Generate DT map
-      from preprocessing.utils import generate_distance_transform
-      dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH))
-      if dt_map.ndim == 2:
-          dt_map = np.expand_dims(dt_map.astype(np.float32), axis=0)  # (1, H, W)
-      else:
-          dt_map = dt_map.astype(np.float32)  # keep as (1, H, W)
+        # ✅ Generate Distance Transform map (DT)
+        dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH))
+        dt_map = dt_map.astype(np.float32)  # (1, H, W)
 
-      # Convert to PyTorch tensors
-      image = torch.from_numpy(image).float().permute(2, 0, 1)  # (C, H, W)
-      landmarks = torch.from_numpy(landmarks).float()
-      dt_map = torch.from_numpy(dt_map).float()
+        # Convert to torch tensors
+        image = torch.from_numpy(image).float().permute(2, 0, 1)  # (C, H, W)
+        landmarks = torch.from_numpy(landmarks).float()
+        dt_map = torch.from_numpy(dt_map).float()
 
-      # ✅ Return 3-tuple (image, landmarks, dt_map)
-      return image, landmarks, dt_map
+        # ✅ Return 3-tuple (image, landmarks, dt_map)
+        return image, landmarks, dt_map
 
     def get_batch(self, indices):
         """Get a batch of data"""
         images, labels, dt_maps = [], [], []
-
         for idx in indices:
             image, landmarks, dt_map = self[idx]
             images.append(image)
             labels.append(landmarks)
             dt_maps.append(dt_map)
-
         return torch.stack(images), torch.stack(labels), torch.stack(dt_maps)
