@@ -1,7 +1,6 @@
-"""
-Stage 4 — ATLAS FLOW (SVF Head)
-Predict stationary velocity field v(x) from [F, D] and warp canonical atlas.
-"""
+# ===============================
+# train_svf.py  (FINAL VERSION)
+# ===============================
 
 import torch
 import torch.nn.functional as F
@@ -9,23 +8,30 @@ from torch.utils.data import DataLoader
 import numpy as np
 import argparse
 import os
-import time
 
 from data import Dataset
 from config import cfg
 from models.backbone import ResNetBackbone
 from models.svf_head import SVFHead
 
-# ---- IMPORT ALL LOSSES ----
+# ---- Losses ----
 from losses import (
     huber_landmark_loss,
     jacobian_regularizer,
-    inverse_consistency_loss,
-    advanced_edge_loss        # ★ NEW ADVANCED EDGE LOSS ★
+    inverse_consistency_loss
 )
 
+# ---- Token extraction utilities ----
+from preprocessing.topology import (
+    extract_arc_tokens_from_edgebank,
+    flatten_arc_tokens
+)
+
+from network.token_encoder import TokenEncoder
+
+
 # ============================================================
-#  Utility functions
+# Helper: create grid
 # ============================================================
 def make_meshgrid(B, H, W, device):
     xs = torch.linspace(-1.0, 1.0, W, device=device)
@@ -44,23 +50,27 @@ def warp_with_disp(img, disp, align_corners=False):
     B, C, H, W = img.shape
     base = make_meshgrid(B, H, W, img.device)
     grid = (base + normalize_disp_for_grid(disp, H, W)).clamp(-1, 1)
-    return F.grid_sample(img, grid, mode='bilinear',
-                         padding_mode='border',
-                         align_corners=align_corners)
+    return F.grid_sample(
+        img, grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=align_corners
+    )
 
 
-def warp_disp(field, disp, align_corners=False):
-    return warp_with_disp(field, disp, align_corners)
+def warp_disp(field, disp, ac=False):
+    return warp_with_disp(field, disp, ac)
 
 
-def svf_to_disp(svf, steps=6, align_corners=False):
+def svf_to_disp(svf, steps=6, ac=False):
     disp = svf / (2 ** steps)
     for _ in range(steps):
-        disp = disp + warp_disp(disp, disp, align_corners)
+        disp = disp + warp_disp(disp, disp, ac)
     return disp
 
+
 # ============================================================
-#  Landmark sampler
+# Landmark sampler
 # ============================================================
 def sample_flow_at_points_local(flow, points_px, image_size, align_corners=False):
     B, N, _ = points_px.shape
@@ -75,27 +85,62 @@ def sample_flow_at_points_local(flow, points_px, image_size, align_corners=False
 
     grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(2)
 
-    sampled = F.grid_sample(flow, grid, mode='bilinear',
-                            padding_mode='border',
-                            align_corners=align_corners)
+    sampled = F.grid_sample(
+        flow, grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=align_corners
+    )
 
     return sampled.squeeze(-1).permute(0, 2, 1)
 
 
 # ============================================================
-#  Smoothness only
+# Extra losses
 # ============================================================
+def edge_alignment_loss(warped_edges, target_edges):
+    return F.l1_loss(warped_edges, target_edges)
+
+
 def smoothness_loss(v):
     return (v[:, :, 1:] - v[:, :, :-1]).abs().mean() + \
            (v[:, :, :, 1:] - v[:, :, :, :-1]).abs().mean()
 
 
 # ============================================================
-#  TRAIN STEP
+# NEW: Token extraction from an edge map
 # ============================================================
-def train_step(backbone, svf_head, images, gt_landmarks, dt_maps,
+def compute_tokens(edge_map_tensor, token_encoder):
+    """
+    Input:
+        edge_map_tensor : (B,1,H,W)
+    Output:
+        token embedding: (B,256)
+    """
+    edge_np = edge_map_tensor.detach().cpu().numpy()  # (B,1,H,W)
+    B = edge_np.shape[0]
+
+    all_tokens = []
+    for b in range(B):
+        # Convert to (H,W,1)
+        edge_3ch = np.repeat(edge_np[b, 0:1].transpose(1, 2, 0), 3, axis=2)
+
+        arcs = extract_arc_tokens_from_edgebank(edge_3ch)
+        flat = flatten_arc_tokens(arcs)   # (243,)
+
+        all_tokens.append(flat)
+
+    tokens = torch.tensor(np.stack(all_tokens), dtype=torch.float32)
+    return token_encoder(tokens.to(edge_map_tensor.device))  # (B,256)
+
+
+# ============================================================
+# Training step
+# ============================================================
+def train_step(backbone, svf_head, token_encoder,
+               images, gt_landmarks, dt_maps,
                atlas_edges, atlas_lms, optimizer, device,
-               svf_steps=6, align_corners=False):
+               svf_steps=6, ac=False):
 
     images = images.to(device) / 255.0
     dt_maps = dt_maps.to(device)
@@ -104,95 +149,80 @@ def train_step(backbone, svf_head, images, gt_landmarks, dt_maps,
     B, _, H, W = images.shape
     atlas_lms_batch = atlas_lms.to(device).repeat(B, 1, 1)
 
-    # Backbone → C5
     feats = backbone(images)
     F5 = feats["C5"]
 
-    # Resize DT map
     target_size = (F5.shape[2], F5.shape[3])
-    D_small = F.interpolate(dt_maps, size=target_size, mode="bilinear", align_corners=False)
+    D_small = F.interpolate(dt_maps, size=target_size, mode="bilinear")
 
-    # Predict SVF
     v = svf_head(F5, D_small)
+    disp = svf_to_disp(v, svf_steps, ac)
 
-    # Exponentiate SVF
-    disp = svf_to_disp(v, steps=svf_steps, align_corners=align_corners)
+    atlas_resized = F.interpolate(atlas_edges, size=target_size)
+    warped_edges = warp_with_disp(atlas_resized.repeat(B, 1, 1, 1), disp, ac)
 
-    # Warp atlas edges
-    atlas_resized = F.interpolate(atlas_edges, size=target_size, mode="bilinear", align_corners=False)
-    warped_edges = warp_with_disp(atlas_resized.repeat(B, 1, 1, 1), disp, align_corners)
+    disp_full = F.interpolate(disp, size=(H, W), mode="bilinear")
+    disp_at_lm = sample_flow_at_points_local(disp_full, atlas_lms_batch, (H, W), ac)
 
-    # Full res displacement
-    disp_full = F.interpolate(disp, size=(H, W), mode="bilinear", align_corners=False)
-
-    # Landmark loss
-    disp_at_lm = sample_flow_at_points_local(disp_full, atlas_lms_batch, (H, W), align_corners)
     pred_landmarks = atlas_lms_batch + disp_at_lm
     L_lm = huber_landmark_loss(pred_landmarks, gt_landmarks)
 
-    # ---- EDGE LOSS (ADVANCED VERSION) ----
-    L_edge = advanced_edge_loss(warped_edges, D_small)
-
-    # Smoothness
+    L_edge = edge_alignment_loss(warped_edges, D_small)
     L_smooth = smoothness_loss(v)
+    L_jac = jacobian_regularizer(disp_full)
 
-    # Jacobian regularizer
-    L_jac = jacobian_regularizer(disp_full, neg_weight=10.0, dev_weight=1.0)
+    # Inverse consistency
+    disp_bwd = -disp_full
+    L_inv = inverse_consistency_loss(disp_full, disp_bwd, ac)
 
-    # Inverse Consistency
-    L_inv = inverse_consistency_loss(disp_full, -disp_full, align_corners)
+    # ---- NEW: Token consistency ----
+    T_gt   = compute_tokens(dt_maps, token_encoder)        # (B,256)
+    T_pred = compute_tokens(warped_edges, token_encoder)   # (B,256)
+    L_tok  = F.mse_loss(T_pred, T_gt)
 
-    # ---- TOTAL LOSS ----
     loss = (
         L_lm
-        + L_edge
-        + 0.01 * L_smooth
-        + 0.1 * L_jac
-        + 0.1 * L_inv
+      + L_edge
+      + 0.01 * L_smooth
+      + 0.1 * L_jac
+      + 0.1 * L_inv
+      + 0.0001 * L_tok    # NEW LOSS
     )
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), L_lm.item(), L_edge.item(), L_jac.item(), L_inv.item()
+    return loss.item(), L_lm.item(), L_edge.item(), L_jac.item(), L_inv.item(), L_tok.item()
 
 
 # ============================================================
-#  EPOCH LOOP
+# Epoch loop
 # ============================================================
-def train_epoch(loader, backbone, svf_head, atlas_edges, atlas_lms,
-                optimizer, device, svf_steps=6, align_corners=False):
+def train_epoch(loader, backbone, svf_head, token_encoder,
+                atlas_edges, atlas_lms, optimizer,
+                device, svf_steps=6, ac=False):
 
-    total = total_lm = total_edge = total_jac = total_inv = 0
+    tot = tot_lm = tot_edge = tot_jac = tot_inv = tot_tok = 0
     n = 0
 
     for images, landmarks, dt_maps in loader:
-        L, L_lm, L_edge, L_jac, L_inv = train_step(
-            backbone, svf_head,
+        L, L_lm, L_edge, L_jac, L_inv, L_tok = train_step(
+            backbone, svf_head, token_encoder,
             images, landmarks, dt_maps,
             atlas_edges, atlas_lms,
             optimizer, device,
-            svf_steps, align_corners
+            svf_steps, ac
         )
-        total += L
-        total_lm += L_lm
-        total_edge += L_edge
-        total_jac += L_jac
-        total_inv += L_inv
+        tot += L; tot_lm += L_lm; tot_edge += L_edge
+        tot_jac += L_jac; tot_inv += L_inv; tot_tok += L_tok
         n += 1
 
-    return (
-        total / n,
-        total_lm / n,
-        total_edge / n,
-        total_jac / n,
-        total_inv / n
-    )
+    return (tot/n, tot_lm/n, tot_edge/n, tot_jac/n, tot_inv/n, tot_tok/n)
 
 
 # ============================================================
-#  MAIN
+# MAIN
 # ============================================================
 if __name__ == "__main__":
 
@@ -204,48 +234,45 @@ if __name__ == "__main__":
     parser.add_argument("--align-corners", action="store_true")
     parser.add_argument("--atlas-landmarks", type=str, default="atlas_landmarks_clean.npy")
     parser.add_argument("--atlas-edge", type=str, default="atlas_edge_map.npy")
-
     args = parser.parse_args()
+
     device = cfg.DEVICE
 
-    # Dataset
     train_dataset = Dataset("isbi", "train",
                             batch_size=args.batch_size, shuffle=True)
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size,
                               shuffle=True, num_workers=0)
 
-    # Atlas data
     atlas_edges = torch.tensor(np.load(args.atlas_edge)).float().unsqueeze(0).unsqueeze(0).to(device)
-    atlas_lms = torch.tensor(np.load(args.atlas_landmarks)).float().unsqueeze(0)
+    atlas_lms   = torch.tensor(np.load(args.atlas_landmarks)).float().unsqueeze(0)
 
-    # Models
     backbone = ResNetBackbone("resnet34", pretrained=True, fuse_edges=False).to(device)
-    try:
-        in_ch = backbone.layer4[-1].conv2.out_channels
-    except:
-        in_ch = 512
+    in_ch = getattr(backbone.layer4[-1].conv2, "out_channels", 512)
 
     svf_head = SVFHead(in_channels=in_ch).to(device)
+
+    # ---- NEW: Token Encoder ----
+    token_encoder = TokenEncoder(input_dim=243, hidden=256, out_dim=256).to(device)
+
     optimizer = torch.optim.Adam(svf_head.parameters(), lr=args.lr)
 
-    # Save directory
     save_dir = "/content/drive/MyDrive/atlas_checkpoints/svf"
     os.makedirs(save_dir, exist_ok=True)
 
     print("\n🚀 Training SVF Head...\n")
     for epoch in range(1, args.epochs + 1):
-        L, L_lm, L_edge, L_jac, L_inv = train_epoch(
-            train_loader, backbone, svf_head,
+        L, L_lm, L_edge, L_jac, L_inv, L_tok = train_epoch(
+            train_loader, backbone, svf_head, token_encoder,
             atlas_edges, atlas_lms,
             optimizer, device,
             args.svf_steps, args.align_corners
         )
 
         print(
-            f"Epoch {epoch} | Loss={L:.4f} | "
-            f"L_lm={L_lm:.4f} | L_edge={L_edge:.4f} | "
-            f"L_jac={L_jac:.4f} | L_inv={L_inv:.4f}"
+            f"Epoch {epoch} | "
+            f"Loss={L:.4f} | L_lm={L_lm:.4f} | L_edge={L_edge:.4f} | "
+            f"L_jac={L_jac:.4f} | L_inv={L_inv:.4f} | L_tok={L_tok:.4f}"
         )
 
         torch.save({
