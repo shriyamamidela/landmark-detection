@@ -232,7 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--svf-steps", type=int, default=6)
     parser.add_argument("--align-corners", action="store_true")
-    parser.add_argument("--atlas-landmarks", type=str, default="atlas_landmarks_clean.npy")
+    parser.add_argument("--atlas-landmarks", type=str, default="atlas_landmarks_resized.npy")
     parser.add_argument("--atlas-edge", type=str, default="atlas_edge_map.npy")
     args = parser.parse_args()
 
