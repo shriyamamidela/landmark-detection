@@ -1,7 +1,11 @@
+# data/dataset.py
+
 from data import ISBIDataset, PKUDataset
-from preprocessing import Augmentation
-from preprocessing.utils import generate_distance_transform  # ✅ make sure this exists
+from preprocessing.augmentation_backbone import AugmentationBackbone    # NEW (heavy aug)
+from preprocessing.augmentation_svf import AugmentationSVF              # NEW (light aug)
+from preprocessing.utils import generate_distance_transform
 from paths import Paths
+
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from config import cfg
@@ -10,98 +14,110 @@ import cv2
 import os
 
 
+# ----------------------- #
+# Resize utility
+# ----------------------- #
 def resize(image: np.ndarray, landmarks: np.ndarray):
-    """Resize image and landmarks to match cfg.HEIGHT, cfg.WIDTH."""
     image_height, image_width = image.shape[0:2]
-    ratio_height, ratio_width = (image_height / cfg.HEIGHT), (image_width / cfg.WIDTH)
+    r_h = image_height / cfg.HEIGHT
+    r_w = image_width / cfg.WIDTH
 
-    image = cv2.resize(np.array(image), dsize=(cfg.WIDTH, cfg.HEIGHT), interpolation=cv2.INTER_CUBIC)
-    landmarks = np.vstack([
-        landmarks[:, 0] / ratio_width,
-        landmarks[:, 1] / ratio_height
-    ]).T
+    image = cv2.resize(image, (cfg.WIDTH, cfg.HEIGHT), interpolation=cv2.INTER_CUBIC)
+
+    # scale landmark coordinates
+    landmarks = np.stack([
+        landmarks[:, 0] / r_w,
+        landmarks[:, 1] / r_h
+    ], axis=-1)
 
     return image, landmarks
 
 
+# ----------------------- #
+# Main Dataset Class
+# ----------------------- #
 class Dataset(TorchDataset):
+
     def __init__(
         self,
         name: str,
         mode: str,
         batch_size: int = 1,
-        augmentation: Augmentation = None,
+        augmentation=None,      # <—— now accepts any custom augmentation
         shuffle: bool = False,
     ):
-        # Select dataset type
+        # pick dataset
         if name == "isbi":
             self.dataset = ISBIDataset(Paths.dataset_root_path(name), mode)
         elif name == "pku":
             self.dataset = PKUDataset(Paths.dataset_root_path(name), mode)
         else:
-            raise ValueError(f"'{name}' no such dataset exists in your datasets repository.")
+            raise ValueError(f"No dataset '{name}'")
 
-        self.batch_size = batch_size
-        self.shuffle = shuffle
         self.mode = mode.lower().strip()
+        self.batch_size = batch_size
 
-        if self.shuffle:
+        if shuffle:
             self.dataset.shuffle()
 
-        # ------------------------------------------------------------------ #
-        # ✅ Automatically enable augmentation in training mode
-        # ------------------------------------------------------------------ #
+        # ------------------------------------------- #
+        # AUGMENTATION HANDLING
+        # ------------------------------------------- #
         if augmentation is not None:
+            # user explicitly passed augmentation
             self.augmentation = augmentation
-            print(f"✅ Using custom augmentation for mode '{self.mode}'")
+            print(f"⚡ Using CUSTOM augmentation for mode '{self.mode}'.")
+
         elif self.mode == "train":
-            print("✅ Enabling default augmentation for training mode")
-            self.augmentation = Augmentation(
+            # default behavior → SVF minimal aug (safe)
+            print("📌 Using DEFAULT SVF-safe augmentation for training.")
+            self.augmentation = AugmentationSVF(
                 random_flip=True,
-                landmark_shift=True,
-                add_edges=True
+                landmark_shift=True
             )
+
         else:
             self.augmentation = None
-            print(f"ℹ️ No augmentation applied for mode '{self.mode}'")
+            print(f"ℹ️ No augmentation applied for mode '{self.mode}'.")
 
+    # length
     def __len__(self):
         return len(self.dataset)
 
-    def __getitem__(self, index: int):
+    # get one item
+    def __getitem__(self, index):
         image, landmarks = self.dataset[index]
 
-        # Apply augmentation if available
+        # apply augmentation
         if self.augmentation is not None:
             image, landmarks = self.augmentation.apply(image, landmarks)
 
-        # Resize image and landmarks
+        # resize
         image, landmarks = resize(image, landmarks)
 
-        # Ensure 3 channels (drop alpha / expand grayscale)
+        # ensure 3 channels
         if image.ndim == 2:
             image = np.repeat(image[:, :, None], 3, axis=2)
         elif image.shape[-1] == 4:
             image = image[:, :, :3]
 
-        # ✅ Generate Distance Transform map (DT)
+        # distance transform
         dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH))
-        dt_map = dt_map.astype(np.float32)  # (1, H, W)
+        dt_map = dt_map.astype(np.float32)
 
-        # Convert to torch tensors
-        image = torch.from_numpy(image).float().permute(2, 0, 1)  # (C, H, W)
-        landmarks = torch.from_numpy(landmarks).float()
-        dt_map = torch.from_numpy(dt_map).float()
+        # convert to tensors
+        image = torch.from_numpy(image).float().permute(2, 0, 1)     # C,H,W
+        landmarks = torch.from_numpy(landmarks).float()             # L,2
+        dt_map = torch.from_numpy(dt_map).float()                   # 1,H,W
 
-        # ✅ Return 3-tuple (image, landmarks, dt_map)
         return image, landmarks, dt_map
 
+    # batch retrieval
     def get_batch(self, indices):
-        """Get a batch of data"""
-        images, labels, dt_maps = [], [], []
-        for idx in indices:
-            image, landmarks, dt_map = self[idx]
-            images.append(image)
-            labels.append(landmarks)
-            dt_maps.append(dt_map)
-        return torch.stack(images), torch.stack(labels), torch.stack(dt_maps)
+        imgs, lms, dts = [], [], []
+        for i in indices:
+            img, lm, dt = self[i]
+            imgs.append(img)
+            lms.append(lm)
+            dts.append(dt)
+        return torch.stack(imgs), torch.stack(lms), torch.stack(dts)
