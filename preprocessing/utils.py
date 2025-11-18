@@ -296,3 +296,84 @@ def generate_distance_transform(landmarks: np.ndarray, size: tuple):
         dt = np.zeros_like(dt, dtype=np.float32)
 
     return np.expand_dims(dt.astype(np.float32), axis=0)  # shape (1, H, W)
+# ================================================================
+# AUGMENTATION FUNCTIONS REQUIRED BY augmentation_backbone.py
+# ================================================================
+
+def identity(image):
+    """Return image unchanged."""
+    return image
+
+
+def inversion(image):
+    """Invert image intensities."""
+    return 255 - image
+
+
+def solarization(image, threshold=128):
+    """Solarize image like research paper."""
+    img = image.copy()
+    mask = img < threshold
+    img[mask] = 255 - img[mask]
+    return img
+
+
+def high_pass_filtering(image):
+    """Apply Laplacian high-pass filtering."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap = np.clip((lap - lap.min()) / (lap.max() - lap.min() + 1e-8) * 255, 0, 255)
+    lap = lap.astype(np.uint8)
+    return cv2.cvtColor(lap, cv2.COLOR_GRAY2BGR)
+
+
+def unsharp_masking(image, amount=1.0, radius=5):
+    """Sharpen image using Gaussian blur."""
+    blurred = cv2.GaussianBlur(image, (radius, radius), 0)
+    sharp = cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
+    return sharp
+
+
+def contrast_limited_histogram_equalization(image):
+    """CLAHE enhancement."""
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    lab = cv2.merge((l2, a, b))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def horizontal_flip(image, landmarks):
+    """Research-paper style flip with landmarks."""
+    h, w = image.shape[:2]
+    flipped_img = np.ascontiguousarray(image[:, ::-1])
+    flipped_lm = landmarks.copy()
+    flipped_lm[:, 0] = w - flipped_lm[:, 0]
+    return flipped_img, flipped_lm
+
+
+def random_cropping(image, landmarks, max_crop=50):
+    """Random crop used in research paper."""
+    H, W = image.shape[:2]
+    crop_x = np.random.randint(0, max_crop)
+    crop_y = np.random.randint(0, max_crop)
+
+    cropped = image[crop_y:H, crop_x:W]
+    cropped = cv2.resize(cropped, (W, H))
+
+    lm = landmarks.copy()
+    lm[:, 0] = (landmarks[:, 0] - crop_x) * (W / (W - crop_x))
+    lm[:, 1] = (landmarks[:, 1] - crop_y) * (H / (H - crop_y))
+    return cropped, lm
+
+
+def vertical_shift(image, landmarks, max_shift=20):
+    """Vertical jitter."""
+    shift = np.random.randint(-max_shift, max_shift)
+    M = np.float32([[1, 0, 0], [0, 1, shift]])
+    shifted_img = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
+
+    lm = landmarks.copy()
+    lm[:, 1] += shift
+    return shifted_img, lm
