@@ -2,50 +2,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class SVFHead(nn.Module):
     """
-    Small head that predicts stationary velocity field (svf) with two channels.
-    Input: feature map (B, C, h, w) + optional conditioning (we pass only F5 & D_small in training)
-    Output: (B, 2, h, w) velocities in pixels (approx), small initial magnitude
+    SVF head that takes:
+        - backbone C5 feature map  (B,512,H,W)
+        - downsampled distance transform (B,1,H,W)
+    Concatenates them -> (B,513,H,W)
+    Produces SVF field (B,2,H,W)
     """
 
-    def __init__(self, in_channels=512, hidden=256, out_channels=2, out_scale=16.0):
+    def __init__(self, in_channels=512):
         super().__init__()
-        self.out_scale = float(out_scale)
+
+        # after concatenating DT: +1 channel
+        inc = in_channels + 1   # 512 + 1 = 513
 
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden),
+            nn.Conv2d(inc, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, out_channels, kernel_size=3, padding=1)
+
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 2, kernel_size=3, padding=1)
         )
 
-        # init last conv to small weights so initial displacements are tiny
-        nn.init.normal_(self.net[-1].weight, mean=0.0, std=1e-3)
-        if self.net[-1].bias is not None:
-            nn.init.constant_(self.net[-1].bias, 0.0)
-
-    def forward(self, feats, extra_input=None):
+    def forward(self, feat_c5, dt_small):
         """
-        feats: (B, C, h, w)
-        extra_input: optionally concatenated before final conv (not used by default)
+        feat_c5:  (B,512,H,W)
+        dt_small: (B,1,H,W)
         """
-        x = feats
-        # If extra_input (eg D_small) provided and same size, concat channels
-        if extra_input is not None:
-            # expect extra_input (B,1,h,w) or (B,k,h,w)
-            if extra_input.shape[2:] != x.shape[2:]:
-                extra_resized = F.interpolate(extra_input, size=x.shape[2:], mode="bilinear", align_corners=False)
-            else:
-                extra_resized = extra_input
-            x = torch.cat([x, extra_resized], dim=1)
 
-        # If we concatenated, the in_channels will not match; ensure network was constructed appropriately.
-        out = self.net(x)
+        # concatenate along channel dim
+        x = torch.cat([feat_c5, dt_small], dim=1)   # → (B,513,H,W)
 
-        # scale output — this constrains initial magnitude (tweak out_scale if needed)
-        return out * (self.out_scale / 255.0)
+        out = self.net(x)  # → (B,2,H,W)
+        return out
