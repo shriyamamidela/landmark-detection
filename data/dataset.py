@@ -1,4 +1,4 @@
-# data/dataset.py  — FIXED VERSION (LETTERBOX RESIZE)
+# data/dataset.py — FINAL FIXED VERSION (LETTERBOX + EDGE MAP + SAFE SVF AUG)
 
 from data import ISBIDataset, PKUDataset
 from preprocessing.augmentation_backbone import AugmentationBackbone
@@ -14,7 +14,7 @@ import cv2
 
 
 # ============================================================
-# LETTERBOX RESIZE (preserve aspect ratio!!!)
+# LETTERBOX RESIZE (preserve aspect ratio)
 # ============================================================
 def letterbox_resize(image, landmarks, out_h=cfg.HEIGHT, out_w=cfg.WIDTH):
     H, W = image.shape[:2]
@@ -26,7 +26,7 @@ def letterbox_resize(image, landmarks, out_h=cfg.HEIGHT, out_w=cfg.WIDTH):
     # resize
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-    # pad on bottom-right only
+    # pad on bottom-right ONLY
     canvas = np.zeros((out_h, out_w, 3), dtype=resized.dtype)
     canvas[:new_h, :new_w] = resized
 
@@ -34,6 +34,19 @@ def letterbox_resize(image, landmarks, out_h=cfg.HEIGHT, out_w=cfg.WIDTH):
     landmarks = landmarks * scale   # scale both x,y
 
     return canvas, landmarks
+
+
+# ============================================================
+# EDGE MAP GENERATION (safe for SVF)
+# ============================================================
+def compute_edge_map(image):
+    """
+    Returns an edge map in shape (H, W) float32 in [0,1].
+    Uses Canny but safe parameters for cephalograms.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 160)
+    return edges.astype(np.float32) / 255.0
 
 
 # ============================================================
@@ -61,7 +74,8 @@ class Dataset(TorchDataset):
             print(f"⚡ Using CUSTOM augmentation for mode '{self.mode}'.")
         elif self.mode == "train":
             print("📌 Using DEFAULT SVF-safe augmentation for training.")
-            self.augmentation = AugmentationSVF(random_flip=True, landmark_shift=True)
+            # SAFE: ONLY flip (no landmark_shift!!)
+            self.augmentation = AugmentationSVF(random_flip=True)
         else:
             self.augmentation = None
             print(f"ℹ️ No augmentation applied for mode '{self.mode}'.")
@@ -70,36 +84,53 @@ class Dataset(TorchDataset):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        image, landmarks = self.dataset[index]
+        image, landmarks = self.dataset[index]     # numpy (H,W,3), (N,2)
 
-        # augmentation
+        # ---------- SAFE AUGMENTATION ----------
         if self.augmentation is not None:
             image, landmarks = self.augmentation.apply(image, landmarks)
 
-        # FIXED RESIZE (NO distortion)
+        # ---------- LETTERBOX RESIZE ----------
         image, landmarks = letterbox_resize(image, landmarks)
 
-        # force 3-channels
+        # ---------- FORCE 3-CHANNEL ----------
         if image.ndim == 2:
             image = np.repeat(image[:, :, None], 3, axis=2)
         elif image.shape[-1] == 4:
             image = image[:, :, :3]
 
-        # distance transform map
-        dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH)).astype(np.float32)
+        # ---------- EDGE MAP ----------
+        edge_map = compute_edge_map(image)    # (H,W)
 
-        # convert to tensors
-        image = torch.from_numpy(image).float().permute(2, 0, 1)
+        # ---------- DT MAP ----------
+        dt_map = generate_distance_transform(
+            landmarks, (cfg.HEIGHT, cfg.WIDTH)
+        ).astype(np.float32)
+
+        # ---------- TO TENSORS ----------
+        image = torch.from_numpy(image).float().permute(2, 0, 1) / 255.0
         landmarks = torch.from_numpy(landmarks).float()
-        dt_map = torch.from_numpy(dt_map).float()
+        dt_map = torch.from_numpy(dt_map).float().unsqueeze(0)    # (1,H,W)
+        edge_map = torch.from_numpy(edge_map).float().unsqueeze(0)
 
-        return image, landmarks, dt_map
+        # Final output:
+        # image: (3,H,W)
+        # landmarks: (N,2)
+        # dt_map: (1,H,W)
+        # edge_map: (1,H,W)
+        return image, landmarks, dt_map, edge_map
 
     def get_batch(self, indices):
-        imgs, lms, dts = [], [], []
+        imgs, lms, dts, edges = [], [], [], []
         for i in indices:
-            img, lm, dt = self[i]
+            img, lm, dt, edge = self[i]
             imgs.append(img)
             lms.append(lm)
             dts.append(dt)
-        return torch.stack(imgs), torch.stack(lms), torch.stack(dts)
+            edges.append(edge)
+        return (
+            torch.stack(imgs),
+            torch.stack(lms),
+            torch.stack(dts),
+            torch.stack(edges)
+        )
