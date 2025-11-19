@@ -1,8 +1,8 @@
-# data/dataset.py
+# data/dataset.py  — FIXED VERSION (LETTERBOX RESIZE)
 
 from data import ISBIDataset, PKUDataset
-from preprocessing.augmentation_backbone import AugmentationBackbone    # NEW (heavy aug)
-from preprocessing.augmentation_svf import AugmentationSVF              # NEW (light aug)
+from preprocessing.augmentation_backbone import AugmentationBackbone
+from preprocessing.augmentation_svf import AugmentationSVF
 from preprocessing.utils import generate_distance_transform
 from paths import Paths
 
@@ -11,42 +11,37 @@ from torch.utils.data import Dataset as TorchDataset
 from config import cfg
 import numpy as np
 import cv2
-import os
 
 
-# ----------------------- #
-# Resize utility
-# ----------------------- #
-def resize(image: np.ndarray, landmarks: np.ndarray):
-    image_height, image_width = image.shape[0:2]
-    r_h = image_height / cfg.HEIGHT
-    r_w = image_width / cfg.WIDTH
+# ============================================================
+# LETTERBOX RESIZE (preserve aspect ratio!!!)
+# ============================================================
+def letterbox_resize(image, landmarks, out_h=cfg.HEIGHT, out_w=cfg.WIDTH):
+    H, W = image.shape[:2]
 
-    image = cv2.resize(image, (cfg.WIDTH, cfg.HEIGHT), interpolation=cv2.INTER_CUBIC)
+    scale = min(out_w / W, out_h / H)
+    new_w = int(W * scale)
+    new_h = int(H * scale)
 
-    # scale landmark coordinates
-    landmarks = np.stack([
-        landmarks[:, 0] / r_w,
-        landmarks[:, 1] / r_h
-    ], axis=-1)
+    # resize
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-    return image, landmarks
+    # pad on bottom-right only
+    canvas = np.zeros((out_h, out_w, 3), dtype=resized.dtype)
+    canvas[:new_h, :new_w] = resized
+
+    # scale landmarks
+    landmarks = landmarks * scale   # scale both x,y
+
+    return canvas, landmarks
 
 
-# ----------------------- #
-# Main Dataset Class
-# ----------------------- #
+# ============================================================
+# DATASET WRAPPER
+# ============================================================
 class Dataset(TorchDataset):
+    def __init__(self, name, mode, batch_size=1, augmentation=None, shuffle=False):
 
-    def __init__(
-        self,
-        name: str,
-        mode: str,
-        batch_size: int = 1,
-        augmentation=None,      # <—— now accepts any custom augmentation
-        shuffle: bool = False,
-    ):
-        # pick dataset
         if name == "isbi":
             self.dataset = ISBIDataset(Paths.dataset_root_path(name), mode)
         elif name == "pku":
@@ -60,59 +55,46 @@ class Dataset(TorchDataset):
         if shuffle:
             self.dataset.shuffle()
 
-        # ------------------------------------------- #
-        # AUGMENTATION HANDLING
-        # ------------------------------------------- #
+        # augmentation choice
         if augmentation is not None:
-            # user explicitly passed augmentation
             self.augmentation = augmentation
             print(f"⚡ Using CUSTOM augmentation for mode '{self.mode}'.")
-
         elif self.mode == "train":
-            # default behavior → SVF minimal aug (safe)
             print("📌 Using DEFAULT SVF-safe augmentation for training.")
-            self.augmentation = AugmentationSVF(
-                random_flip=True,
-                landmark_shift=True
-            )
-
+            self.augmentation = AugmentationSVF(random_flip=True, landmark_shift=True)
         else:
             self.augmentation = None
             print(f"ℹ️ No augmentation applied for mode '{self.mode}'.")
 
-    # length
     def __len__(self):
         return len(self.dataset)
 
-    # get one item
     def __getitem__(self, index):
         image, landmarks = self.dataset[index]
 
-        # apply augmentation
+        # augmentation
         if self.augmentation is not None:
             image, landmarks = self.augmentation.apply(image, landmarks)
 
-        # resize
-        image, landmarks = resize(image, landmarks)
+        # FIXED RESIZE (NO distortion)
+        image, landmarks = letterbox_resize(image, landmarks)
 
-        # ensure 3 channels
+        # force 3-channels
         if image.ndim == 2:
             image = np.repeat(image[:, :, None], 3, axis=2)
         elif image.shape[-1] == 4:
             image = image[:, :, :3]
 
-        # distance transform
-        dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH))
-        dt_map = dt_map.astype(np.float32)
+        # distance transform map
+        dt_map = generate_distance_transform(landmarks, (cfg.HEIGHT, cfg.WIDTH)).astype(np.float32)
 
         # convert to tensors
-        image = torch.from_numpy(image).float().permute(2, 0, 1)     # C,H,W
-        landmarks = torch.from_numpy(landmarks).float()             # L,2
-        dt_map = torch.from_numpy(dt_map).float()                   # 1,H,W
+        image = torch.from_numpy(image).float().permute(2, 0, 1)
+        landmarks = torch.from_numpy(landmarks).float()
+        dt_map = torch.from_numpy(dt_map).float()
 
         return image, landmarks, dt_map
 
-    # batch retrieval
     def get_batch(self, indices):
         imgs, lms, dts = [], [], []
         for i in indices:
