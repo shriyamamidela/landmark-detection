@@ -26,30 +26,33 @@ def huber_landmark_loss(pred_landmarks, gt_landmarks, delta=1.0, reduction='mean
 # --------------------------------------------------------------
 def compute_jacobian_det_safe(disp):
     """
-    disp: (B,2,H,W)
-    Uses forward differences (stable for small spatial maps).
+    disp: (B,2,H,W), pixel displacement field
+    Returns a safe jacobian determinant penalty.
+    Computes forward differences (same shape everywhere).
     """
-    u = disp[:, 0]   # (B,H,W)
-    v = disp[:, 1]
 
-    du_dx = u[:, :, 1:] - u[:, :, :-1]
-    dv_dx = v[:, :, 1:] - v[:, :, :-1]
+    # displacement components
+    ux = disp[:, 0:1]  # (B,1,H,W)
+    uy = disp[:, 1:2]
 
-    du_dy = u[:, 1:, :] - u[:, :-1, :]
-    dv_dy = v[:, 1:, :] - v[:, :-1, :]
+    # forward differences (safe, shape-preserving)
+    dx_ux = ux[:, :, :, 1:] - ux[:, :, :, :-1]     # (B,1,H,W-1)
+    dy_ux = ux[:, :, 1:, :] - ux[:, :, :-1, :]     # (B,1,H-1,W)
+    dx_uy = uy[:, :, :, 1:] - uy[:, :, :, :-1]     # (B,1,H,W-1)
+    dy_uy = uy[:, :, 1:, :] - uy[:, :, :-1, :]     # (B,1,H-1,W)
 
-    du_dx = du_dx[:, :, :-1]
-    dv_dx = dv_dx[:, :, :-1]
-    du_dy = du_dy[:, :-1, :]
-    dv_dy = dv_dy[:, :-1, :]
+    # Make shapes match by cropping to inner area
+    H = min(dx_ux.shape[2], dy_ux.shape[2])
+    W = min(dy_ux.shape[3], dx_ux.shape[3])
 
-    J11 = 1 + du_dx
-    J12 = du_dy
-    J21 = dv_dx
-    J22 = 1 + dv_dy
+    J11 = dx_ux[:, :, :H, :W]
+    J12 = dy_ux[:, :, :H, :W]
+    J21 = dx_uy[:, :, :H, :W]
+    J22 = dy_uy[:, :, :H, :W]
 
     det = J11 * J22 - J12 * J21
     return det
+
 
 
 def jacobian_regularizer(disp, neg_weight=1.0, dev_weight=0.1):
