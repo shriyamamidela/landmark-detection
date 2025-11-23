@@ -35,9 +35,12 @@ def load_backbone_weights_safe(backbone, path, device):
     if not os.path.exists(path):
         print("Backbone checkpoint not found:", path)
         return backbone
+
     state = torch.load(path, map_location=device)
+
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
+
     try:
         backbone.load_state_dict(state, strict=False)
         print("Loaded backbone weights (strict=False) from:", path)
@@ -50,51 +53,54 @@ def load_backbone_weights_safe(backbone, path, device):
     return backbone
 
 # ---------------------------
-# training step (half-res DT)
+# training step
 # ---------------------------
 def train_step(model, backbone, optimizer, batch, alphas_cumprod, device, Ttimesteps, target_size):
     images, dt_maps_full, tokens = batch
-    # images: (B,3,800,645)  dt_maps_full: (B,1,800,645)
+
     images = images.to(device)
     tokens = tokens.to(device)
 
-    # downsample DT to target_size (H2, W2)
+    # Downsample DT to half-res (400,322)
     dt_maps = F.interpolate(dt_maps_full, size=target_size, mode="bilinear", align_corners=False)
+    dt_maps = dt_maps.to(device)
 
     B = images.size(0)
 
-    # compute backbone features (frozen)
+    # 1. Backbone features
     with torch.no_grad():
         feats = backbone(images)
-        F_feat = feats["C5"]  # (B, feat_dim, h, w)
+        F_feat = feats["C5"]
 
-    # build edge bank from full-res images (use resized later)
+    # 2. Edge bank
     edge_banks = []
     for img in images:
         np_img = (img.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
         edge = generate_edge_bank(np_img)
         edge_tensor = torch.from_numpy(edge).permute(2, 0, 1).unsqueeze(0).float() / 255.0
         edge_banks.append(edge_tensor)
-    E = torch.cat(edge_banks, dim=0).to(device)  # (B,3,800,645)
 
-    # Resize edge bank to F_feat spatial dims for extra_cond
+    E = torch.cat(edge_banks, dim=0).to(device)
+
+    # Resize to match backbone feature map resolution
     if E.shape[2:] != F_feat.shape[2:]:
         E_resized = F.interpolate(E, size=F_feat.shape[2:], mode="bilinear", align_corners=False)
     else:
         E_resized = E
-    extra_cond = torch.cat([F_feat, E_resized], dim=1)  # (B, feat_dim+3, h, w)
 
-    # forward diffusion: sample timestep and noise (on half-res dt)
+    extra_cond = torch.cat([F_feat, E_resized], dim=1)
+
+    # 3. Diffusion forward step
     t_idx = torch.randint(low=0, high=Ttimesteps, size=(B,), device=device, dtype=torch.long)
     noise = torch.randn_like(dt_maps, device=device)
     x_t = q_sample(dt_maps, t_idx, noise, alphas_cumprod)
 
-    # predict noise
+    # 4. Predict noise
     model.train()
     optimizer.zero_grad()
+
     noise_pred = model(x_t, t_idx.float().unsqueeze(1), tokens, extra_cond=extra_cond)
 
-    # if model outputs different spatial size, resize noise
     if noise_pred.shape != noise.shape:
         noise_resized = F.interpolate(noise, size=noise_pred.shape[2:], mode="bilinear", align_corners=False)
     else:
@@ -103,42 +109,49 @@ def train_step(model, backbone, optimizer, batch, alphas_cumprod, device, Ttimes
     loss = F.mse_loss(noise_pred, noise_resized)
     loss.backward()
     optimizer.step()
+
     return loss.item()
 
 # ---------------------------
 # training loop
 # ---------------------------
-def train_diffusion(model, backbone, dataloader, device, epochs=10, Ttimesteps=500, save_dir="/content/drive/MyDrive/atlas_checkpoints/diffusion_halfres", lr=1e-4):
+def train_diffusion(model, backbone, dataloader, device, epochs=10, Ttimesteps=500,
+                    save_dir="/content/drive/MyDrive/atlas_checkpoints/diffusion_halfres", lr=1e-4):
+
     os.makedirs(save_dir, exist_ok=True)
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
+
     betas = get_beta_schedule(Ttimesteps, device=device)
     alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)   # <<< FIXED (moved to GPU)
 
-    # Target DT size (half of 800x645)
-    target_h = 400
-    target_w = 322
-    target_size = (target_h, target_w)
+    # half-resolution target size
+    target_size = (400, 322)
 
     for epoch in range(1, epochs + 1):
         total_loss = 0.0
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
+
         for batch in pbar:
             loss = train_step(model, backbone, optimizer, batch, alphas_cumprod, device, Ttimesteps, target_size)
             total_loss += loss
             pbar.set_postfix(loss=total_loss / (pbar.n + 1))
-        avg_loss = total_loss / len(dataloader)
-        print(f"\nEpoch {epoch} | Avg loss: {avg_loss:.6f}")
 
-        ckpt_path = os.path.join(save_dir, f"diffusion_halfres_epoch_{epoch}.pth")
+        avg_loss = total_loss / len(dataloader)
+        print(f"\nEpoch {epoch} | Avg Loss: {avg_loss:.6f}")
+
+        ckpt = os.path.join(save_dir, f"diffusion_halfres_epoch_{epoch}.pth")
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss": avg_loss,
             "timestamp": datetime.now().isoformat()
-        }, ckpt_path)
-        print("Saved checkpoint →", ckpt_path)
+        }, ckpt)
+
+        print("Saved checkpoint →", ckpt)
 
 # ---------------------------
 # CLI
@@ -160,14 +173,17 @@ if __name__ == "__main__":
 
     dataset_root = "/content/landmark-detection/datasets/augmented_ceph"
     train_dataset = AugCephDataset(dataset_root)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=2, pin_memory=True)
     print("Samples:", len(train_dataset))
 
     backbone = ResNetBackbone(name="resnet34", pretrained=False, fuse_edges=False).to(device)
     backbone = load_backbone_weights_safe(backbone, args.backbone_weights, device)
     backbone.eval()
 
-    model = ConditionalUNet(cond_dim=args.cond_dim, in_ch=args.in_ch, out_ch=1, feat_dim=512).to(device)
+    model = ConditionalUNet(cond_dim=args.cond_dim, in_ch=args.in_ch,
+                            out_ch=1, feat_dim=512).to(device)
 
     train_diffusion(model, backbone, train_loader, device,
-                    epochs=args.epochs, Ttimesteps=args.timesteps, save_dir=args.save_dir, lr=args.lr)
+                    epochs=args.epochs, Ttimesteps=args.timesteps,
+                    save_dir=args.save_dir, lr=args.lr)
