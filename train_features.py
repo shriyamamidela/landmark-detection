@@ -17,8 +17,8 @@ import os
 import argparse
 from datetime import datetime
 
-# 🟨 NEW IMPORT
-from aug_dataset import AugCephDataset   # <— you will create this file
+# NEW IMPORT
+from aug_dataset import AugCephDataset
 
 
 # ---------------------------------------------------------------------- #
@@ -47,7 +47,9 @@ class ResNetEdgeFusionModel(nn.Module):
         c5 = feats["C5"]
 
         e = self.edge_encoder(edge_bank)
-        e_resized = nn.functional.interpolate(e, size=c5.shape[2:], mode="bilinear", align_corners=False)
+        e_resized = nn.functional.interpolate(
+            e, size=c5.shape[2:], mode="bilinear", align_corners=False
+        )
 
         fused = torch.cat([c5, e_resized], dim=1)
         dt_pred = self.fusion_head(fused)
@@ -68,20 +70,27 @@ def train_step(images, dt_targets, model, optimizer, device):
     images = images.to(device)
     dt_targets = dt_targets.to(device)
 
-    # edge bank generation
     edge_banks = []
     for img in images:
-        np_img = (img.permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+        np_img = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         edge = generate_edge_bank(np_img)
-        edge_tensor = torch.from_numpy(edge).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        edge_tensor = (
+            torch.from_numpy(edge).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        )
         edge_banks.append(edge_tensor)
+
     edge_banks = torch.cat(edge_banks, dim=0).to(device)
 
     optimizer.zero_grad()
     dt_pred = model(images, edge_banks)
 
     if dt_pred.shape[2:] != dt_targets.shape[2:]:
-        dt_targets = nn.functional.interpolate(dt_targets, size=dt_pred.shape[2:], mode="bilinear", align_corners=False)
+        dt_targets = nn.functional.interpolate(
+            dt_targets,
+            size=dt_pred.shape[2:],
+            mode="bilinear",
+            align_corners=False,
+        )
 
     loss = dt_loss(dt_pred, dt_targets)
     loss.backward()
@@ -106,7 +115,11 @@ def train(train_loader, model, optimizer, device, epochs=10, save_dir="checkpoin
             total_loss += loss
 
             if (batch_idx + 1) % 10 == 0:
-                print(f"\rEpoch {epoch} [{batch_idx+1}/{len(train_loader)}] Loss: {total_loss/(batch_idx+1):.4f}", end="")
+                print(
+                    f"\rEpoch {epoch} [{batch_idx+1}/{len(train_loader)}] "
+                    f"Loss: {total_loss/(batch_idx+1):.4f}",
+                    end="",
+                )
 
         epoch_loss = total_loss / len(train_loader)
         print(f"\nEpoch {epoch} Avg Loss: {epoch_loss:.4f}")
@@ -116,7 +129,10 @@ def train(train_loader, model, optimizer, device, epochs=10, save_dir="checkpoin
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
-            torch.save(model.state_dict(), os.path.join(save_dir, "best_resnet_edge.pth"))
+            torch.save(
+                model.state_dict(),
+                os.path.join(save_dir, "best_resnet_edge.pth"),
+            )
             print(f"✓ Saved best model (loss={best_loss:.4f})")
 
     print("\nTraining complete.")
@@ -136,13 +152,19 @@ if __name__ == "__main__":
     device = cfg.DEVICE
 
     print("\n🟨 Loading Augmented Dataset…")
-    train_dataset = AugCephDataset(root="/content/drive/MyDrive/datasets/augmented_ceph")
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    train_dataset = AugCephDataset(
+        root="/content/landmark-detection/datasets/augmented_ceph"
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
+    )
 
     print(f"Total samples: {len(train_dataset)}")
 
     print("\n🟨 Creating Model…")
-    model = ResNetEdgeFusionModel(backbone_name=args.backbone, pretrained=True).to(device)
+    model = ResNetEdgeFusionModel(
+        backbone_name=args.backbone, pretrained=True
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     train(train_loader, model, optimizer, device, epochs=args.epochs)
