@@ -82,7 +82,7 @@ if __name__ == "__main__":
     print("Device:", device)
 
     # load model
-    ckpt = "/content/drive/MyDrive/atlas_checkpoints/diffusion_halfres/diffusion_halfres_epoch_10.pth"
+    ckpt = "/content/drive/MyDrive/atlas_checkpoints/diffusion_halfres/diffusion_halfres_epoch_7.pth"
     model = ConditionalUNet(cond_dim=243, in_ch=1, out_ch=1, feat_dim=512).to(device)
     sd = torch.load(ckpt, map_location=device)
     if isinstance(sd, dict) and "model_state_dict" in sd:
