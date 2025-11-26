@@ -1,4 +1,4 @@
-# sample_diffusion_halfres.py
+# sample_diffusion_dt_full_ddim.py
 import os
 import torch
 import torch.nn.functional as F
@@ -12,163 +12,181 @@ from preprocessing.utils import generate_edge_bank
 from preprocessing.topology import extract_arc_tokens_from_edgebank, flatten_arc_tokens
 from config import cfg
 
+# =========================
+# COSINE SCHEDULE (TRAINING)
+# =========================
+def cosine_beta_schedule(T, s=0.008, device="cpu"):
+    steps = T + 1
+    x = torch.linspace(0, T, steps, device=device)
+    alphas_cum = torch.cos(((x/T) + s)/(1+s) * np.pi*0.5)**2
+    alphas_cum = alphas_cum / alphas_cum[0]
+    betas = 1 - (alphas_cum[1:] / alphas_cum[:-1])
+    return torch.clamp(betas, 1e-4, 0.999)
 
-# ----------------------------------------------------------
-# Beta schedule
-# ----------------------------------------------------------
-def get_beta_schedule(T, beta_start=1e-4, beta_end=0.02, device="cpu"):
-    return torch.linspace(beta_start, beta_end, T, device=device)
+
+# =========================
+# LOAD MODEL / LOAD EMA
+# =========================
+def load_model_or_ema(model, path, device):
+    sd = torch.load(path, map_location=device)
+
+    if "model_state_dict" in sd:
+        sd = sd["model_state_dict"]
+
+    msd = model.state_dict()
+    for k in msd.keys():
+        if k in sd:
+            msd[k] = sd[k].to(device)
+    model.load_state_dict(msd)
+    return model
 
 
-# ----------------------------------------------------------
-# SINGLE REVERSE STEP (FIXED VERSION)
-# ----------------------------------------------------------
+# =========================
+# CORRECTED DDIM STEP
+# =========================
 @torch.no_grad()
-def p_sample(model, x_t, t_idx, T_tok, alphas, alphas_cumprod, betas,
-             latent_shape, extra_cond=None):
+def ddim_step(model, x_t, t_idx, t_prev, T_tok,
+              alphas, alphas_cum, eta, extra_cond):
 
-    # t_idx MUST be (B,1)
-    if t_idx.dim() == 1:
-        t_idx = t_idx.unsqueeze(1)
+    if t_idx.dim() == 0:
+        t_idx = t_idx.view(1)
+    if t_prev.dim() == 0:
+        t_prev = t_prev.view(1)
 
-    # Resize x_t to latent size for UNet if needed
-    if x_t.shape[2:] != latent_shape[2:]:
-        x_in = F.interpolate(x_t, size=latent_shape[2:], mode="bilinear", align_corners=False)
-    else:
-        x_in = x_t
+    # ---- predict noise ----
+    eps = model(
+        x_t,
+        t_idx.float().unsqueeze(1),   # (1,1)
+        T_tok,
+        extra_cond=extra_cond
+    )
 
-    # Predict noise
-    eps_theta = model(x_in, t_idx.float(), T_tok, extra_cond=extra_cond)
+    # ---- FIX: resize eps to match x_t ----
+    if eps.shape[2:] != x_t.shape[2:]:
+        eps = F.interpolate(eps, size=x_t.shape[2:], mode="bilinear", align_corners=False)
 
-    # Resize prediction back
-    if eps_theta.shape[2:] != x_t.shape[2:]:
-        eps_theta = F.interpolate(eps_theta, size=x_t.shape[2:], mode="bilinear", align_corners=False)
+    # convert scalars
+    a_t  = alphas[t_idx][0]
+    ab_t = alphas_cum[t_idx][0]
+    ab_prev = alphas_cum[t_prev][0]
 
-    # Gather α, β values
-    alpha_t      = alphas[t_idx[:,0]].view(-1,1,1,1)
-    alpha_bar_t  = alphas_cumprod[t_idx[:,0]].view(-1,1,1,1)
-    beta_t       = betas[t_idx[:,0]].view(-1,1,1,1)
+    # ---- Compute x0 prediction ----
+    x0_hat = (x_t - torch.sqrt(1 - ab_t) * eps) / torch.sqrt(ab_t)
+    x0_hat = torch.clamp(x0_hat, -1, 1)
 
-    sqrt_recip_alpha_t = 1.0 / torch.sqrt(alpha_t)
-    sqrt_one_minus_ab  = torch.sqrt(1 - alpha_bar_t)
-    sqrt_beta_t        = torch.sqrt(beta_t)
+    # ---- DDIM parameters ----
+    sigma = eta * torch.sqrt((1 - ab_prev)/(1 - ab_t)) * torch.sqrt(1 - ab_t/ab_prev)
+    c = torch.sqrt(1 - ab_prev - sigma*sigma)
+    noise = torch.randn_like(x_t) if (t_idx > 0) else 0
 
-    # Add noise unless t=0
-    z = torch.randn_like(x_t) if t_idx.item() > 0 else 0
-
-    x_prev = (
-        sqrt_recip_alpha_t *
-        (x_t - ((1 - alpha_t) / sqrt_one_minus_ab) * eps_theta)
-    ) + sqrt_beta_t * z
-
+    x_prev = torch.sqrt(ab_prev) * x0_hat + c * eps + sigma * noise
     return x_prev
 
 
-# ----------------------------------------------------------
-# FULL SAMPLING (20–30 STEPS)
-# ----------------------------------------------------------
+# =========================
+# DDIM SAMPLER
+# =========================
 @torch.no_grad()
-def sample_halfres(model, backbone, img_rgb, steps=20, device="cuda"):
+def sample_ddim_fast(model, backbone, img_rgb, steps=20, device="cuda", eta=0.0):
 
-    # Resize input image to training size (800x645)
     H, W = 800, 645
+    hh, ww = 400, 322   # keep as your model was trained
+
+    # image
     img_rs = cv2.resize(img_rgb, (W, H))
+    img_t = torch.from_numpy(img_rs).permute(2,0,1).unsqueeze(0).float().to(device)/255.
 
-    img_t = torch.from_numpy(img_rs).permute(2,0,1).unsqueeze(0).float().to(device) / 255.0
-
-    # 1) Backbone F features
+    # backbone
     feats = backbone(img_t)
     F_feat = feats["C5"]
 
-    # 2) Edge bank E
+    # edges
     edge = generate_edge_bank(img_rs)
-    edge_t = torch.from_numpy(edge).permute(2,0,1).unsqueeze(0).float().to(device) / 255.0
-
-    if edge_t.shape[2:] != F_feat.shape[2:]:
-        edge_res = F.interpolate(edge_t, size=F_feat.shape[2:], mode="bilinear", align_corners=False)
-    else:
-        edge_res = edge_t
-
+    edge_t = torch.from_numpy(edge).permute(2,0,1).unsqueeze(0).float().to(device)/255.
+    edge_res = F.interpolate(edge_t, size=F_feat.shape[2:], mode="bilinear", align_corners=False)
     extra_cond = torch.cat([F_feat, edge_res], dim=1)
 
-    # 3) Topology T tokens
+    # tokens
     arcs = extract_arc_tokens_from_edgebank(edge)
     T_vec = flatten_arc_tokens(arcs)
-    T_tok = torch.from_numpy(T_vec).unsqueeze(0).to(device).float()
+    T_tok = torch.from_numpy(T_vec).unsqueeze(0).float().to(device)
 
-    # 4) Reverse diffusion schedule
-    betas = get_beta_schedule(steps, device=device)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    # schedule
+    betas = cosine_beta_schedule(500, device=device)
+    alphas = 1 - betas
+    alphas_cum = torch.cumprod(alphas, dim=0)
 
-    # 5) Latent UNet resolution
-    half_h, half_w = 400, 322
+    # time grid
+    ts = torch.linspace(499, 0, steps, dtype=torch.long, device=device)
 
-    latent_out = model(
-        torch.randn(1,1,half_h,half_w).to(device),
-        torch.zeros((1,1), device=device),  # timestep
-        T_tok,
-        extra_cond=extra_cond,
-    )
-    latent_shape = latent_out.shape
+    # start noise
+    x_t = torch.randn(1,1,hh,ww).to(device)
 
-    # 6) Start from random noise
-    x_t = torch.randn(1,1,half_h,half_w).to(device)
+    # steps
+    for i in range(steps-1):
+        t_idx  = ts[i].view(1)
+        t_prev = ts[i+1].view(1)
 
-    # 7) Reverse diffusion
-    for i in reversed(range(steps)):
-        t_idx = torch.tensor([i], device=device, dtype=torch.long)
-        x_t = p_sample(
-            model, x_t, t_idx, T_tok,
-            alphas, alphas_cumprod, betas,
-            latent_shape, extra_cond=extra_cond
-        )
+        x_t = ddim_step(model, x_t, t_idx, t_prev, T_tok,
+                        alphas, alphas_cum, eta, extra_cond)
 
-    # Final resize to original DT full size (800x645)
-    dt_pred_half = x_t.squeeze().cpu().numpy()
-    dt_pred_full = cv2.resize(dt_pred_half, (W, H))
+    # final
+    t_idx = ts[-1].view(1)
+    x_t = ddim_step(model, x_t, t_idx, t_idx, T_tok,
+                    alphas, alphas_cum, eta, extra_cond)
 
-    return dt_pred_full, edge
+    # upsample
+    dt_half = x_t.squeeze().cpu().numpy()
+    dt_full = cv2.resize(dt_half, (W, H))
+    return dt_full, edge
 
 
-# ----------------------------------------------------------
+# =========================
 # MAIN
-# ----------------------------------------------------------
+# =========================
 if __name__ == "__main__":
+
+    CKPT_EMA = "/content/diffusion_halfres_epoch_20_ema.pth"
+    IMG_PATH = "/content/landmark-detection/datasets/augmented_ceph/image_dir/001_aug0.png"
+
     device = cfg.DEVICE
     print("Device:", device)
 
-    # Load diffusion model
-    ckpt = "/content/drive/MyDrive/atlas_checkpoints/diffusion_halfres/diffusion_halfres_epoch_7.pth"
-    model = ConditionalUNet(cond_dim=243, in_ch=1, out_ch=1, feat_dim=512).to(device)
-    sd = torch.load(ckpt, map_location=device)
-    if "model_state_dict" in sd:
-        sd = sd["model_state_dict"]
-    model.load_state_dict(sd)
+    model = ConditionalUNet(243,1,1,512).to(device)
+    print("Loading:", CKPT_EMA)
+    model = load_model_or_ema(model, CKPT_EMA, device)
     model.eval()
-    print("Loaded diffusion model:", ckpt)
 
-    # Load backbone
+    # backbone
     backbone = ResNetBackbone("resnet34", pretrained=False, fuse_edges=False).to(device)
     bb_ckpt = "/content/drive/MyDrive/atlas_checkpoints/checkpoints_resnet_edge/best_resnet_edge.pth"
-    state = torch.load(bb_ckpt, map_location=device)
-    if "model_state_dict" in state:
-        state = state["model_state_dict"]
-    backbone.load_state_dict(state, strict=False)
+    bb = torch.load(bb_ckpt, map_location=device)
+    if "model_state_dict" in bb:
+        bb = bb["model_state_dict"]
+    backbone.load_state_dict(bb, strict=False)
     backbone.eval()
-    print("Loaded backbone")
 
-    # Load test image
-    img_path = "/content/drive/MyDrive/datasets/ISBI Dataset/Dataset/Training/001.bmp"
-    img = cv2.imread(img_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # image
+    img = cv2.imread(IMG_PATH)
+    img_rgxab = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # Run sampling
-    dt_pred, edge = sample_halfres(model, backbone, img_rgb, steps=20, device=device)
+    # DDIM sampling
+    dt_pred, edge = sample_ddim_fast(model, backbone, img_rgb,
+                                     steps=20, device=device, eta=0.0)
 
-    # Plot
+    arr = np.array(dt_pred)
+    print("\n=== DT RANGE ===")
+    print("min:", float(arr.min()))
+    print("max:", float(arr.max()))
+    print("mean:", float(arr.mean()))
+    print("================\n")
+
+    # normalize for display
+    vmin, vmax = np.percentile(arr,1), np.percentile(arr,99)
+    dt_vis = np.clip((arr-vmin)/(vmax-vmin+1e-9),0,1)
+
     plt.figure(figsize=(12,4))
     plt.subplot(1,3,1); plt.imshow(img_rgb); plt.title("Input"); plt.axis("off")
-    plt.subplot(1,3,2); plt.imshow(edge[...,0], cmap="gray"); plt.title("Canny"); plt.axis("off")
-    plt.subplot(1,3,3); plt.imshow(dt_pred, cmap="magma"); plt.title("Predicted DT"); plt.axis("off")
+    plt.subplot(1,3,2); plt.imshow(edge[...,0], cmap="gray"); plt.title("Edge"); plt.axis("off")
+    plt.subplot(1,3,3); plt.imshow(dt_vis, cmap="magma"); plt.title("DDIM Predicted DT"); plt.axis("off")
     plt.show()
