@@ -1,278 +1,274 @@
-# train_svf.py  — FINAL V6 (token-loss enabled, robust, main() entry included)
+#!/usr/bin/env python3
 """
-Train SVF head (Atlas-flow) with:
-  - landmark Huber loss
-  - atlas-edge alignment (L1)
-  - SVF smoothness
-  - jacobian regularizer
-  - inverse consistency
-  - optional token consistency (topology tokens)
+train_svf.py — SVF head training adapted for your augmented dataset (Option A).
 
-Usage example:
-  python train_svf.py \
-    --epochs 40 \
-    --batch-size 1 \
-    --atlas-landmarks atlas_landmarks_resized.npy \
-    --atlas-edge atlas_edge_map_resized.npy \
-    --use-token-loss
+- Uses AugCephDataset from /dgxa_home/se22ucse250/landmark-detection-main/datasets/augmented_ceph
+- Loads atlas from provided paths
+- Evaluates MRE (mm) and SDR@2/2.5/3/4 mm for train and test sets each epoch
+- Saves checkpoints and visualization images per epoch
 
-Notes:
- - Expects data.Dataset("isbi","train") to return (image, landmarks, dt_map, edge_map)
- - Images expected in dataset are letterbox-resized to (cfg.HEIGHT, cfg.WIDTH).
- - Methods reference (for traceability): METHODS_PDF points at local file path.
+Note: set mm_per_pixel according to your pixel-mm conversion (default 0.1 mm/pixel).
 """
 import os
 import argparse
 import time
+from pathlib import Path
+from typing import Tuple, List
+
 import numpy as np
+import cv2
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from data import Dataset
-from config import cfg
+# Repo imports (assumes repo root in PYTHONPATH)
 from models.backbone import ResNetBackbone
 from models.svf_head import SVFHead
-from network.token_encoder import TokenEncoder
-
-from losses import (
-    huber_landmark_loss,
-    jacobian_regularizer,
-    inverse_consistency_loss
+from network.token_encoder import TokenEncoder  # optional
+from losses import huber_landmark_loss, jacobian_regularizer, inverse_consistency_loss
+from preprocessing.topology import extract_arc_tokens_from_edgebank, flatten_arc_tokens  # optional
+from config import cfg
+from models.svf_utils import (
+    svf_to_disp,
+    warp_with_disp,
+    sample_flow_at_points_local
 )
 
-# local methods doc (for your traceability)
-METHODS_PDF = "/mnt/data/ATLAS_FLOW_DIFF_methods_summary.pdf"
 
-# optional arc-token utilities (if present)
-try:
-    from preprocessing.topology import extract_arc_tokens_from_edgebank, flatten_arc_tokens
-    HAVE_ARC = True
-except Exception:
-    HAVE_ARC = False
+# ---------------------------
+# Augmented training dataset (expects image_dir, label_dir, token_dir)
+# ---------------------------
+class AugCephDataset(Dataset):
+    def __init__(self, root: str):
+        self.root = root
+        self.img_dir = os.path.join(root, "image_dir")
+        self.lbl_dir = os.path.join(root, "label_dir")
+        self.tok_dir = os.path.join(root, "token_dir")
+        self.files = sorted([f for f in os.listdir(self.img_dir) if f.lower().endswith((".png", ".jpg"))])
+        print(f"📦 AugCephDataset loaded: {len(self.files)} samples")
 
+    def __len__(self):
+        return len(self.files)
 
-# -------------------------
-# Grid, warping helpers
-# -------------------------
-def make_meshgrid(B, H, W, device):
-    xs = torch.linspace(-1.0, 1.0, W, device=device)
-    ys = torch.linspace(-1.0, 1.0, H, device=device)
-    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-    return torch.stack([xx, yy], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
+    def _load_pts(self, path):
+        pts = []
+        with open(path, "r") as f:
+            for ln in f:
+                x, y = ln.strip().split(",")
+                pts.append([float(x), float(y)])
+        return np.array(pts, dtype=np.float32)
 
+    def _compute_dt(self, im_shape, landmarks, radius=3):
+        H, W = im_shape[:2]
+        mask = np.zeros((H, W), dtype=np.uint8)
+        for (x, y) in landmarks:
+            cx, cy = int(x), int(y)
+            if 0 <= cx < W and 0 <= cy < H:
+                cv2.circle(mask, (cx, cy), radius, 255, -1)
+        mask_inv = 255 - mask
+        dt = cv2.distanceTransform(mask_inv, cv2.DIST_L2, 5)
+        if dt.max() > 0:
+            dt = dt / dt.max()
+        return dt.astype(np.float32)
 
-def normalize_disp_for_grid(disp, H, W):
-    dx = disp[:, 0] / (W / 2.0)
-    dy = disp[:, 1] / (H / 2.0)
-    return torch.stack([dx, dy], dim=-1)
+    def __getitem__(self, idx):
+        fname = self.files[idx]
+        img_path = os.path.join(self.img_dir, fname)
+        img_bgr = cv2.imread(img_path)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img_t = torch.from_numpy(img_rgb).permute(2, 0, 1) / 255.0
 
+        lbl_path = os.path.join(self.lbl_dir, fname.replace(".png", ".txt").replace(".jpg", ".txt"))
+        landmarks = self._load_pts(lbl_path)
+        landmarks_t = torch.from_numpy(landmarks).float()  # (L,2)
 
-def warp_with_disp(img, disp, align_corners=False):
-    B, C, H, W = img.shape
-    base = make_meshgrid(B, H, W, img.device)
-    grid = (base + normalize_disp_for_grid(disp, H, W)).clamp(-1, 1)
-    return F.grid_sample(img, grid, mode='bilinear', padding_mode='border', align_corners=align_corners)
+        dt_np = self._compute_dt(img_rgb.shape, landmarks)
+        dt_t = torch.from_numpy(dt_np).unsqueeze(0).float()  # (1,H,W)
 
+        edge = cv2.Canny(img_bgr, 80, 160).astype(np.float32) / 255.0
+        edge_t = torch.from_numpy(edge).unsqueeze(0).float()
 
-def warp_disp(field, disp, align_corners=False):
-    return warp_with_disp(field, disp, align_corners)
+        tok_path = os.path.join(self.tok_dir, fname.replace(".png", ".npy").replace(".jpg", ".npy"))
+        token_t = torch.from_numpy(np.load(tok_path).astype(np.float32)) if os.path.exists(tok_path) else torch.zeros(243, dtype=torch.float32)
 
-
-def svf_to_disp(svf, steps=6, align_corners=False):
-    # exponentiate SVF by scaling and squaring
-    disp = svf / (2 ** steps)
-    for _ in range(steps):
-        disp = disp + warp_disp(disp, disp, align_corners)
-    return disp
-
-
-# -------------------------
-# Landmark sampler (grid_sample)
-# -------------------------
-def sample_flow_at_points_local(flow, points_px, image_size, align_corners=False):
-    B, N, _ = points_px.shape
-    H, W = image_size
-
-    if align_corners:
-        x_norm = 2 * (points_px[..., 0] / (W - 1)) - 1
-        y_norm = 2 * (points_px[..., 1] / (H - 1)) - 1
-    else:
-        x_norm = 2 * ((points_px[..., 0] + 0.5) / W) - 1
-        y_norm = 2 * ((points_px[..., 1] + 0.5) / H) - 1
-
-    grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(2)  # (B,N,1,2)
-
-    sampled = F.grid_sample(
-        flow, grid, mode="bilinear", padding_mode="border", align_corners=align_corners
-    )  # -> (B,2,N,1)
-
-    sampled = sampled.squeeze(-1)  # (B,2,N)
-    sampled = sampled.permute(0, 2, 1)  # (B,N,2)
-    return sampled
+        return img_t, landmarks_t, dt_t, edge_t, token_t
 
 
-# -------------------------
-# Small helper losses
-# -------------------------
-def edge_alignment_loss(warped_edges, target_edges):
-    return F.l1_loss(warped_edges, target_edges)
+# ---------------------------
+# Small test dataset loader (images + labels only; no tokens)
+# ---------------------------
+class TestImageFolder(Dataset):
+    def __init__(self, root_images: str, root_labels: str):
+        self.img_dir = root_images
+        self.lbl_dir = root_labels
+        self.files = sorted([f for f in os.listdir(self.img_dir) if f.lower().endswith((".png", ".jpg"))])
+        print(f"📦 Test dataset loaded: {len(self.files)} samples from {self.img_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def _load_pts(self, path):
+        pts = []
+        with open(path, "r") as f:
+            for ln in f:
+                x, y = ln.strip().split(",")
+                pts.append([float(x), float(y)])
+        return np.array(pts, dtype=np.float32)
+
+    def __getitem__(self, idx):
+        fname = self.files[idx]
+        img_bgr = cv2.imread(os.path.join(self.img_dir, fname))
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img_t = torch.from_numpy(img_rgb).permute(2, 0, 1) / 255.0
+
+        lbl_path = os.path.join(self.lbl_dir, fname.replace(".png", ".txt").replace(".jpg", ".txt"))
+        landmarks = self._load_pts(lbl_path)
+        landmarks_t = torch.from_numpy(landmarks).float()
+
+        # compute DT & edge on the fly
+        H, W = img_rgb.shape[:2]
+        mask = np.zeros((H, W), dtype=np.uint8)
+        for (x, y) in landmarks:
+            cx, cy = int(x), int(y)
+            if 0 <= cx < W and 0 <= cy < H:
+                cv2.circle(mask, (cx, cy), 3, 255, -1)
+        dt = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 5)
+        if dt.max() > 0:
+            dt = dt / dt.max()
+        dt_t = torch.from_numpy(dt).unsqueeze(0).float()
+
+        edge = cv2.Canny(img_bgr, 80, 160).astype(np.float32) / 255.0
+        edge_t = torch.from_numpy(edge).unsqueeze(0).float()
+
+        token_t = torch.zeros(243, dtype=torch.float32)  # placeholder
+        return img_t, landmarks_t, dt_t, edge_t, token_t, fname
 
 
-def smoothness_loss(v):
-    return (v[:, :, 1:] - v[:, :, :-1]).abs().mean() + (v[:, :, :, 1:] - v[:, :, :, :-1]).abs().mean()
-
-
-# -------------------------
-# Token computation (batched)
-# -------------------------
-def fast_edge_descriptor(edge_map_tensor, bins=243):
-    # Compute a fast gradient-magnitude histogram descriptor as fallback
-    arr = edge_map_tensor.detach().cpu().numpy()
-    if arr.ndim == 4:
-        arr = arr[:, 0, :, :]
-    B = arr.shape[0]
-    feats = []
-    for i in range(B):
-        im = arr[i].astype(np.float32)
-        gx = np.gradient(im)[1]
-        gy = np.gradient(im)[0]
-        mag = np.sqrt(gx ** 2 + gy ** 2).ravel()
-        maxv = mag.max() if mag.max() > 0 else 1.0
-        hist, _ = np.histogram(mag, bins=bins, range=(0.0, maxv))
-        hist = hist.astype(np.float32)
-        hist /= (hist.sum() + 1e-8)
-        feats.append(hist)
-    return torch.tensor(np.stack(feats, axis=0), dtype=torch.float32)
-
-
-def compute_tokens(edge_map_tensor, token_encoder=None):
-    """
-    Returns either raw descriptor (if token_encoder is None) or encoded embedding (B, out_dim).
-    """
-    device = edge_map_tensor.device
-    if HAVE_ARC:
-        # heavy arc-based extractor (matches prior pipeline) - may be slower
-        arr = edge_map_tensor.detach().cpu().numpy()
-        if arr.ndim == 4:
-            arr = arr[:, 0, :, :]
-        toks = []
-        for im in arr:
-            im_u8 = np.clip(im * 255.0, 0, 255).astype(np.uint8)
-            im_3ch = np.stack([im_u8, im_u8, im_u8], axis=-1)
-            arcs = extract_arc_tokens_from_edgebank(im_3ch)
-            flat = flatten_arc_tokens(arcs)
-            toks.append(flat)
-        desc = torch.tensor(np.stack(toks), dtype=torch.float32, device=device)
-    else:
-        desc = fast_edge_descriptor(edge_map_tensor).to(device)
-
-    if token_encoder is None:
-        return desc
-    return token_encoder(desc)
-
-
-# -------------------------
-# Robust normalization to (B,1,H,W)
-# -------------------------
-def ensure_bchw(t, B, name, device):
-    """
-    Normalize a torch.Tensor t to shape (B,1,H,W).
-    Accepts dims: 2 (H,W), 3 (B,H,W) or (1,H,W) or (C,H,W), 4 (B,C,H,W).
-    """
-    if not isinstance(t, torch.Tensor):
-        raise TypeError(f"{name} must be torch.Tensor, got {type(t)}")
+# ---------------------------
+# Utility: ensure (B,1,H,W)
+# ---------------------------
+def ensure_bchw(t: torch.Tensor, B: int, name: str, device):
+    if t is None:
+        raise RuntimeError(f"{name} is None")
     t = t.to(device)
     if t.dim() == 2:
-        t = t.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        t = t.unsqueeze(0).unsqueeze(0)
     elif t.dim() == 3:
         # (B,H,W) or (1,H,W) or (C,H,W)
         if t.shape[0] == B:
-            t = t.unsqueeze(1)  # (B,1,H,W)
+            t = t.unsqueeze(1)
         elif t.shape[0] == 1:
-            t = t.unsqueeze(1)  # (1,1,H,W)
+            t = t.unsqueeze(1)
         elif t.shape[0] in (1, 3):
-            # (C,H,W) -> treat as (1,C,H,W)
             t = t.unsqueeze(0)
             if t.shape[1] > 1:
                 t = t.mean(dim=1, keepdim=True)
         else:
-            # ambiguous - try to treat as (B,H,W)
-            if t.shape[0] == B:
-                t = t.unsqueeze(1)
-            else:
-                raise RuntimeError(f"Unexpected 3D shape for {name}: {t.shape}")
+            raise RuntimeError(f"Unexpected 3D shape for {name}: {t.shape}")
     elif t.dim() == 4:
         if t.shape[1] > 1:
             t = t.mean(dim=1, keepdim=True)
     else:
         raise RuntimeError(f"Unexpected dims for {name}: {t.dim()}")
-    if not (t.dim() == 4 and t.shape[1] == 1):
-        raise RuntimeError(f"{name} normalization failed; got shape {t.shape}")
     return t
 
 
-# -------------------------
-# Single training step
-# -------------------------
-def train_step(backbone, svf_head, token_encoder,
-               images, gt_landmarks, dt_maps, edge_maps,
-               atlas_edges, atlas_lms,
-               optimizer, device,
-               svf_steps=6, align_corners=False, use_token_loss=True):
+# ---------------------------
+# Metrics: MRE (mm) and SDR thresholds (mm)
+# ---------------------------
+def compute_mre_sdr_batch(pred_landmarks: torch.Tensor, gt_landmarks: torch.Tensor, mm_per_pixel=0.1,
+                          thresholds_mm=(2.0, 2.5, 3.0, 4.0)) -> Tuple[float, dict]:
+    """
+    pred_landmarks, gt_landmarks: (B, L, 2) in pixel coords
+    Returns: MRE (mm), SDR dict {thr: percent}
+    """
+    d = torch.norm(pred_landmarks - gt_landmarks, dim=-1)  # (B,L) pixels
+    d_mm = d * mm_per_pixel
+    mre = d_mm.mean().item()
+    sdrs = {}
+    total = d_mm.numel()
+    for thr in thresholds_mm:
+        inside = (d_mm <= thr).sum().item()
+        sdrs[thr] = 100.0 * inside / total
+    return mre, sdrs
 
-    # images normalization
+
+# ---------------------------
+# Visualize & save sample predictions
+# ---------------------------
+def save_visuals(save_dir: str, fname: str, img_rgb: np.ndarray, atlas_img: np.ndarray,
+                 atlas_lms: np.ndarray, pred_lms: np.ndarray, warped_atlas_edges: np.ndarray):
+    os.makedirs(save_dir, exist_ok=True)
+    h, w = img_rgb.shape[:2]
+    vis = np.zeros((h, w * 3, 3), dtype=np.uint8)
+
+    # input
+    vis[:, :w] = img_rgb.astype(np.uint8)
+
+    # atlas image
+    a_img = atlas_img.astype(np.uint8)
+    vis[:, w:2 * w] = a_img
+
+    # warped atlas edge overlay
+    edge_rgb = np.stack([warped_atlas_edges * 255,]*3, axis=-1).astype(np.uint8)
+    vis[:, 2 * w:3 * w] = edge_rgb
+
+    # overlay landmarks (pred) on left image
+    for (x, y) in pred_lms:
+        cv2.circle(vis[:, :w], (int(x), int(y)), 2, (255, 0, 0), -1)
+    # atlas lm on middle
+    for (x, y) in atlas_lms:
+        cv2.circle(vis[:, w:2 * w], (int(x), int(y)), 2, (0, 255, 0), -1)
+
+    outp = os.path.join(save_dir, fname)
+    cv2.imwrite(outp, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+
+# ---------------------------
+# Single training step (same core as your earlier code)
+# ---------------------------
+def train_step(backbone, svf_head, token_encoder, optim,
+               images, landmarks, dt_maps, edge_maps,
+               atlas_edges, atlas_lms, device,
+               use_token_loss=True, svf_steps=6, align_corners=False):
     if images.max() > 2.0:
         images = images.float().to(device) / 255.0
     else:
         images = images.float().to(device)
-
-    gt_landmarks = gt_landmarks.to(device)
-
     B = images.shape[0]
-    atlas_lms_batch = atlas_lms.to(device).repeat(B, 1, 1)
+    landmarks = landmarks.to(device)
 
-    # ensure dt_maps & edge_maps are (B,1,H,W)
-    dt_maps = ensure_bchw(dt_maps, B, "dt_maps", images.device)
-    edge_maps = ensure_bchw(edge_maps, B, "edge_maps", images.device)
+    dt_maps = ensure_bchw(dt_maps, B, "dt_maps", device)
+    edge_maps = ensure_bchw(edge_maps, B, "edge_maps", device)
 
-    # backbone features
     feats = backbone(images)
     F5 = feats.get("C5", None) if isinstance(feats, dict) else feats
     if F5 is None:
-        # fallback: take last feature
-        if isinstance(feats, dict):
-            F5 = list(feats.values())[-1]
-        else:
-            raise RuntimeError("Backbone returned None for features")
+        F5 = list(feats.values())[-1]
 
     Hf, Wf = F5.shape[2], F5.shape[3]
-
-    # resize dt + patient edge to feature resolution
     D_small = F.interpolate(dt_maps, size=(Hf, Wf), mode='bilinear', align_corners=align_corners)
     patient_edge_small = F.interpolate(edge_maps, size=(Hf, Wf), mode='bilinear', align_corners=align_corners)
 
-    # predict svf
-    v = svf_head(F5, D_small)  # expects (B,2,Hf,Wf) in pixel units
-
-    # exponentiate
+    v = svf_head(F5, D_small)
     disp = svf_to_disp(v, steps=svf_steps, align_corners=align_corners)
 
-    # warp atlas edges -> compare with patient small edge map
     atlas_resized = F.interpolate(atlas_edges, size=(Hf, Wf), mode='bilinear', align_corners=align_corners)
     atlas_rep = atlas_resized.repeat(B, 1, 1, 1)
     warped_edges = warp_with_disp(atlas_rep, disp, align_corners=align_corners)
 
-    # upsample disp to full resolution and predict landmarks
     H, W = images.shape[2], images.shape[3]
     disp_full = F.interpolate(disp, size=(H, W), mode='bilinear', align_corners=align_corners)
+
+    # sample displacement at atlas landmark positions
+    atlas_lms_batch = atlas_lms.to(device).repeat(B, 1, 1)
     disp_at_lm = sample_flow_at_points_local(disp_full, atlas_lms_batch, (H, W), align_corners=align_corners)
-    pred_landmarks = atlas_lms_batch + disp_at_lm
+    pred_lms = atlas_lms_batch + disp_at_lm
 
     # losses
-    L_lm = huber_landmark_loss(pred_landmarks, gt_landmarks)
-    L_edge = edge_alignment_loss(warped_edges, patient_edge_small)
-    L_smooth = smoothness_loss(v)
+    L_lm = huber_landmark_loss(pred_lms, landmarks)
+    L_edge = F.l1_loss(warped_edges, patient_edge_small)
+    L_smooth = ((v[:, :, 1:] - v[:, :, :-1]).abs().mean() + (v[:, :, :, 1:] - v[:, :, :, :-1]).abs().mean())
     L_jac = jacobian_regularizer(disp_full)
     L_inv = inverse_consistency_loss(disp_full, -disp_full, align_corners=align_corners)
 
@@ -282,18 +278,11 @@ def train_step(backbone, svf_head, token_encoder,
         T_pred = compute_tokens(warped_edges.detach(), token_encoder)
         L_tok = F.mse_loss(T_pred, T_gt)
 
-    loss = (
-        1.0 * L_lm +
-        1.0 * L_edge +
-        0.01 * L_smooth +
-        0.1 * L_jac +
-        0.1 * L_inv +
-        1e-4 * L_tok
-    )
+    loss = (1.0 * L_lm + 1.0 * L_edge + 0.01 * L_smooth + 0.1 * L_jac + 0.1 * L_inv + 1e-4 * L_tok)
 
-    optimizer.zero_grad()
+    optim.zero_grad()
     loss.backward()
-    optimizer.step()
+    optim.step()
 
     return {
         "loss": loss.item(),
@@ -302,141 +291,92 @@ def train_step(backbone, svf_head, token_encoder,
         "L_smooth": L_smooth.item(),
         "L_jac": L_jac.item(),
         "L_inv": L_inv.item(),
-        "L_tok": L_tok.item()
+        "L_tok": L_tok.item(),
+        "pred_lms": pred_lms.detach().cpu()
     }
 
 
-# -------------------------
-# Epoch loop
-# -------------------------
-def train_epoch(loader, backbone, svf_head, token_encoder,
-                atlas_edges, atlas_lms, optimizer,
-                device, svf_steps=6, align_corners=False, use_token_loss=True):
-
-    totals = {k: 0.0 for k in ["loss", "L_lm", "L_edge", "L_smooth", "L_jac", "L_inv", "L_tok"]}
-    n = 0
-
-    backbone.train()
-    svf_head.train()
-    if token_encoder is not None:
-        token_encoder.train()
-
-    for batch in loader:
-        # dataset returns: image, landmarks, dt_map, edge_map
-        if len(batch) == 4:
-            images, landmarks, dt_maps, edge_maps = batch
-        else:
-            raise RuntimeError("Dataset must return (image, landmarks, dt_map, edge_map)")
-
-        
-        # ---- ROBUST NORMALIZATION FOR dt_maps / edge_maps ----
-        # convert possible weird shapes (e.g., (B,1,1,H,W) or (B,1,H,W,1)) -> (B,1,H,W)
-        def normalize_to_b1hw(t, B, name):
-            # t: torch.Tensor
-            if not isinstance(t, torch.Tensor):
-                return t
-            # if shape already correct, return
-            if t.dim() == 4 and t.shape[0] == B and t.shape[1] == 1:
-                return t
-            # if 5D: try to collapse the middle singleton(s)
-            if t.dim() == 5:
-                # try last two dims as H,W
-                H = t.shape[-2]; W = t.shape[-1]
-                try:
-                    t = t.reshape(B, -1, H, W)   # combine extra singleton dims into channel axis
-                except Exception:
-                    # fallback: squeeze any singleton axes except batch
-                    dims = [i for i in range(t.dim()) if t.shape[i] == 1 and i != 0]
-                    for d in sorted(dims, reverse=True):
-                        t = t.squeeze(d)
-                    # after squeeze attempt, if still problematic, raise
-                    if not (t.dim() == 4 and t.shape[0] == B):
-                        raise RuntimeError(f"Unable to normalize {name}; got shape {t.shape}")
-                # if we combined multi-channels, reduce to single channel by mean
-                if t.shape[1] > 1:
-                    t = t.mean(dim=1, keepdim=True)
-                return t
-            # if shape is (1,H,W) or (H,W)
-            if t.dim() == 3 and t.shape[0] == B:
-                # treat as (B,H,W) -> add channel
-                return t.unsqueeze(1)
-            if t.dim() == 3 and t.shape[0] != B and t.shape[0] in (1,3):
-                # (C,H,W) -> average channels -> (1,H,W) then unsqueeze batch
-                t2 = t.mean(dim=0, keepdim=True)  # (1,H,W)
-                return t2.unsqueeze(0) if B != 1 else t2.unsqueeze(0)
-            if t.dim() == 2:
-                # (H,W) -> (1,1,H,W)
-                return t.unsqueeze(0).unsqueeze(0)
-            # if already (B, H, W) -> add channel
-            if t.dim() == 3 and t.shape[0] == B:
-                return t.unsqueeze(1)
-            raise RuntimeError(f"Unexpected shape for {name}: {t.shape}")
-
-        # apply normalization (safe guards)
-        try:
-            dt_maps = normalize_to_b1hw(dt_maps, images.shape[0], "dt_maps")
-            edge_maps = normalize_to_b1hw(edge_maps, images.shape[0], "edge_maps")
-        except Exception as e:
-            # helpful error with shapes
-            print("ERROR normalizing dt/edge maps:", e)
-            raise
-
-        
-        # now call train_step with normalized tensors
-        out = train_step(
-            backbone, svf_head, token_encoder,
-            images, landmarks, dt_maps, edge_maps,
-            atlas_edges, atlas_lms,
-            optimizer, device,
-            svf_steps, align_corners, use_token_loss
-        )
+# ---------------------------
+# Evaluate on a loader (returns MRE & SDRs aggregated)
+# ---------------------------
+def evaluate_loader(backbone, svf_head, token_encoder, loader, atlas_edges, atlas_lms, device, mm_per_pixel=0.1, max_samples=None):
+    backbone.eval(); svf_head.eval()
+    all_dists = []
+    thresholds = (2.0, 2.5, 3.0, 4.0)
+    with torch.no_grad():
+        n = 0
+        for batch in loader:
+            if isinstance(batch, tuple) and len(batch) == 6:
+                images, landmarks, dt_maps, edge_maps, tokens, fnames = batch
+            else:
+                images, landmarks, dt_maps, edge_maps, tokens = batch
+                fnames = None
+            # forward small eval pass reusing train_step but no optimizer step
+            out = train_step(backbone, svf_head, token_encoder, optim=torch.optim.SGD([], lr=1e-6),
+                             images=images, landmarks=landmarks, dt_maps=dt_maps, edge_maps=edge_maps,
+                             atlas_edges=atlas_edges, atlas_lms=atlas_lms, device=device,
+                             use_token_loss=(token_encoder is not None), svf_steps=6, align_corners=False)
+            pred_lms = out["pred_lms"]  # (B,L,2)
+            gt_lms = landmarks
+            d = torch.norm(pred_lms - gt_lms, dim=-1)  # pixels
+            all_dists.append(d.cpu().numpy())
+            n += 1
+            if (max_samples is not None) and (n >= max_samples):
+                break
+    all_dists = np.concatenate([x.reshape(-1) for x in all_dists], axis=0)
+    all_dists_mm = all_dists * mm_per_pixel
+    mre = float(all_dists_mm.mean())
+    sdrs = {}
+    for thr in thresholds:
+        sdrs[thr] = 100.0 * float((all_dists_mm <= thr).sum()) / float(all_dists_mm.size)
+    return mre, sdrs
 
 
-        for k in totals:
-            totals[k] += out[k]
-        n += 1
-
-    for k in totals:
-        totals[k] /= max(1, n)
-    return totals
-
-
-# -------------------------
-# Main
-# -------------------------
+# ---------------------------
+# Main training script
+# ---------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--eval-batch", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--svf-steps", type=int, default=6)
-    parser.add_argument("--align-corners", action="store_true")
-    parser.add_argument("--atlas-landmarks", type=str, default="atlas_landmarks_resized.npy")
-    parser.add_argument("--atlas-edge", type=str, default="atlas_edge_map_resized.npy")
+    parser.add_argument("--atlas-landmarks", type=str, required=True)
+    parser.add_argument("--atlas-edge", type=str, required=True)
     parser.add_argument("--save-dir", type=str, default="./checkpoints/svf")
-    parser.add_argument("--use-token-loss", action="store_true", help="Enable topology token loss (slower).")
-    parser.add_argument("--finetune-backbone", action="store_true", help="Allow backbone parameters to be updated.")
+    parser.add_argument("--use-token-loss", action="store_true")
+    parser.add_argument("--finetune-backbone", action="store_true")
+    parser.add_argument("--mm-per-pixel", type=float, default=0.1)
+    parser.add_argument("--test1-dir", type=str, default="/dgxa_home/se22ucse250/landmark-detection-main/datasets/aug_test/test1changed_1")
+    parser.add_argument("--test2-dir", type=str, default="/dgxa_home/se22ucse250/landmark-detection-main/datasets/aug_test/test2changed_2")
     args = parser.parse_args()
 
     device = cfg.DEVICE if hasattr(cfg, "DEVICE") else ("cuda" if torch.cuda.is_available() else "cpu")
-
-    # quick startup print (helps verify script actually executed)
-    print("📌 Using DEFAULT SVF-safe augmentation for training.")
-    print("📌 Methods PDF (for traceability) at:", METHODS_PDF)
     print("Device:", device)
+    os.makedirs(args.save_dir, exist_ok=True)
+    viz_dir = os.path.join(args.save_dir, "viz")
+    os.makedirs(viz_dir, exist_ok=True)
 
-    # Dataset + loader
-    train_dataset = Dataset("isbi", "train", batch_size=args.batch_size, shuffle=True)
-    if len(train_dataset) == 0:
-        raise RuntimeError("Dataset is empty. Check data paths and Dataset implementation.")
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    # Datasets
+    train_root = "/dgxa_home/se22ucse250/landmark-detection-main/datasets/augmented_ceph"
+    train_ds = AugCephDataset(train_root)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
+
+    # small eval loader on trainset (non-shuffled)
+    eval_train_loader = DataLoader(train_ds, batch_size=args.eval_batch, shuffle=False, num_workers=2)
+
+    # test loaders (each has images/labels subfolders inside provided path)
+    test1_img_dir = os.path.join(args.test1_dir, "images")
+    test1_lbl_dir = os.path.join(args.test1_dir, "labels")
+    test2_img_dir = os.path.join(args.test2_dir, "images")
+    test2_lbl_dir = os.path.join(args.test2_dir, "labels")
+
+    test1_ds = TestImageFolder(test1_img_dir, test1_lbl_dir)
+    test2_ds = TestImageFolder(test2_img_dir, test2_lbl_dir)
+    test1_loader = DataLoader(test1_ds, batch_size=1, shuffle=False, num_workers=1)
+    test2_loader = DataLoader(test2_ds, batch_size=1, shuffle=False, num_workers=1)
 
     # atlas
-    if not os.path.exists(args.atlas_landmarks):
-        raise FileNotFoundError(f"Atlas landmarks not found: {args.atlas_landmarks}")
-    if not os.path.exists(args.atlas_edge):
-        raise FileNotFoundError(f"Atlas edge not found: {args.atlas_edge}")
-
     atlas_edges_np = np.load(args.atlas_edge)
     atlas_edges = torch.tensor(atlas_edges_np).float()
     if atlas_edges.max() > 2.0:
@@ -448,23 +388,18 @@ def main():
 
     # Models
     backbone = ResNetBackbone("resnet34", pretrained=True, fuse_edges=False).to(device)
-    try:
-        in_ch = backbone.layer4[-1].conv2.out_channels
-    except Exception:
-        in_ch = 512
+    in_ch = 512
     svf_head = SVFHead(in_channels=in_ch).to(device)
 
     token_encoder = None
     if args.use_token_loss:
         token_encoder = TokenEncoder(input_dim=243, hidden=256, out_dim=256).to(device)
 
-    # Freeze backbone unless finetune requested
     if not args.finetune_backbone:
         for p in backbone.parameters():
             p.requires_grad = False
-        print("📌 Backbone frozen. Use --finetune-backbone to train it.")
+        print("Backbone frozen (use --finetune-backbone to enable).")
 
-    # optimizer
     params = list(svf_head.parameters())
     if token_encoder is not None:
         params += list(token_encoder.parameters())
@@ -473,40 +408,94 @@ def main():
 
     optimizer = torch.optim.Adam(params, lr=args.lr)
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    print("\n🚀 Training SVF Head...\n")
-
     best_loss = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        metrics = train_epoch(
-            train_loader, backbone, svf_head, token_encoder,
-            atlas_edges, atlas_lms,
-            optimizer, device,
-            svf_steps=args.svf_steps, align_corners=args.align_corners, use_token_loss=args.use_token_loss
-        )
+        backbone.train(); svf_head.train()
+        if token_encoder is not None:
+            token_encoder.train()
 
-        print(
-            f"Epoch {epoch}/{args.epochs} | Loss={metrics['loss']:.4f} | "
-            f"L_lm={metrics['L_lm']:.4f} | L_edge={metrics['L_edge']:.4f} | "
-            f"L_jac={metrics['L_jac']:.4f} | L_inv={metrics['L_inv']:.4f} | L_tok={metrics['L_tok']:.6f} "
-            f"| time={time.time()-t0:.1f}s"
-        )
+        epoch_tot = {"loss": 0.0, "L_lm": 0.0, "L_edge": 0.0, "L_smooth": 0.0, "L_jac": 0.0, "L_inv": 0.0, "L_tok": 0.0}
+        n = 0
+        for batch in train_loader:
+            # dataset returns: img_t, landmarks_t, dt_t, edge_t, token_t
+            images, landmarks, dt_maps, edge_maps, tokens = batch
+            out = train_step(backbone, svf_head, token_encoder, optimizer,
+                             images, landmarks, dt_maps, edge_maps,
+                             atlas_edges, atlas_lms, device,
+                             use_token_loss=(token_encoder is not None),
+                             svf_steps=6, align_corners=False)
+            for k in ["loss", "L_lm", "L_edge", "L_smooth", "L_jac", "L_inv", "L_tok"]:
+                epoch_tot[k] += out.get(k, 0.0)
+            n += 1
+            if n % 200 == 0:
+                print(f"Epoch {epoch} step {n}: loss={epoch_tot['loss']/n:.4f}")
 
+        for k in epoch_tot:
+            epoch_tot[k] /= max(1, n)
+
+        # save checkpoint
         ckpt = {
             "epoch": epoch,
             "svf": svf_head.state_dict(),
             "token_encoder": token_encoder.state_dict() if token_encoder is not None else None,
             "opt": optimizer.state_dict(),
-            "loss": metrics["loss"]
+            "loss": epoch_tot["loss"]
         }
-        torch.save(ckpt, os.path.join(args.save_dir, f"svf_epoch_{epoch}.pth"))
-        if metrics["loss"] < best_loss:
-            best_loss = metrics["loss"]
+        ckpt_path = os.path.join(args.save_dir, f"svf_epoch_{epoch}.pth")
+        torch.save(ckpt, ckpt_path)
+        if epoch_tot["loss"] < best_loss:
+            best_loss = epoch_tot["loss"]
             torch.save(ckpt, os.path.join(args.save_dir, "svf_best.pth"))
             print("✅ Saved best checkpoint")
 
-    print("\n✅ Training complete.")
+        # evaluation: train subset + both tests
+        print(f"\n--- Epoch {epoch} summary ---")
+        print(f"Train avg losses: loss={epoch_tot['loss']:.6f} L_lm={epoch_tot['L_lm']:.6f} L_edge={epoch_tot['L_edge']:.6f}")
+
+        # evaluate on small subset of train (max_samples controls number of batches used)
+        mre_train, sdr_train = evaluate_loader(backbone, svf_head, token_encoder, eval_train_loader, atlas_edges, atlas_lms, device, mm_per_pixel=args.mm_per_pixel, max_samples=50)
+        print(f"Train MRE: {mre_train:.4f} mm | SDRs: {sdr_train}")
+
+        mre_t1, sdr_t1 = evaluate_loader(backbone, svf_head, token_encoder, test1_loader, atlas_edges, atlas_lms, device, mm_per_pixel=args.mm_per_pixel, max_samples=None)
+        print(f"Test1 MRE: {mre_t1:.4f} mm | SDRs: {sdr_t1}")
+
+        mre_t2, sdr_t2 = evaluate_loader(backbone, svf_head, token_encoder, test2_loader, atlas_edges, atlas_lms, device, mm_per_pixel=args.mm_per_pixel, max_samples=None)
+        print(f"Test2 MRE: {mre_t2:.4f} mm | SDRs: {sdr_t2}")
+
+        # save viz for first few test images from test1
+        with torch.no_grad():
+            cnt = 0
+            for img_t, lm_t, dt_t, edge_t, tok_t, fname in test1_loader:
+                # forward to get disp+pred_lms and warped edges
+                images = img_t.to(device)
+                feats = backbone(images)
+                F5 = feats.get("C5", None) if isinstance(feats, dict) else feats
+                Hf, Wf = F5.shape[2], F5.shape[3]
+                D_small = F.interpolate(dt_t.to(device), size=(Hf, Wf), mode='bilinear')
+                v = svf_head(F5, D_small)
+                disp = svf_to_disp(v, steps=6)
+                atlas_resized = F.interpolate(atlas_edges, size=(Hf, Wf), mode='bilinear')
+                atlas_rep = atlas_resized.repeat(1, 1, 1, 1)
+                warped_edges = warp_with_disp(atlas_rep, disp)
+                H, W = images.shape[2], images.shape[3]
+                disp_full = F.interpolate(disp, size=(H, W), mode='bilinear')
+                disp_at_lm = sample_flow_at_points_local(disp_full, atlas_lms.to(device), (H, W))
+                pred_lms = (atlas_lms.to(device) + disp_at_lm)[0].cpu().numpy()
+                # prepare visuals
+                img_rgb = (img_t[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+                atlas_img = np.load(args.atlas_landmarks.replace("atlas_landmarks_resized.npy", "atlas_image_resized.npy")) if os.path.exists(args.atlas_landmarks.replace("atlas_landmarks_resized.npy", "atlas_image_resized.npy")) else np.zeros_like(img_rgb)
+                atlas_img = atlas_img.astype(np.uint8)
+                warped_edges_np = warped_edges[0, 0].cpu().numpy()
+                atlas_lms_np = atlas_lms[0].cpu().numpy()
+                save_visuals(viz_dir, f"epoch{epoch}_test1_{cnt}_{fname[0]}", img_rgb, atlas_img, atlas_lms_np, pred_lms, warped_edges_np)
+                cnt += 1
+                if cnt >= 4:
+                    break
+
+        print(f"Epoch {epoch} done in {time.time() - t0:.1f}s\n")
+
+    print("Training finished.")
 
 
 if __name__ == "__main__":
