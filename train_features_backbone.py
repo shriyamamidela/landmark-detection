@@ -151,7 +151,7 @@ if __name__ == "__main__":
 
     device = cfg.DEVICE
 
-    print("\n🟨 Loading Augmented Dataset…")
+    print("\n Loading Augmented Dataset…")
     train_dataset = AugCephDataset(
         root="/content/landmark-detection/datasets/augmented_ceph"
     )
@@ -161,7 +161,7 @@ if __name__ == "__main__":
 
     print(f"Total samples: {len(train_dataset)}")
 
-    print("\n🟨 Creating Model…")
+    print("\n Creating Model…")
     model = ResNetEdgeFusionModel(
         backbone_name=args.backbone, pretrained=True
     ).to(device)
